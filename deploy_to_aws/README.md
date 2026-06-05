@@ -93,8 +93,9 @@ If you know that suite, the differences here are:
   filesystem, access point, or mount targets to create or delete.
 - **A dedicated task role.** The running container needs to read DynamoDB and
   S3, so `deploy.sh` creates `demoworldfun-viewer-task-role` with a scoped
-  read-only policy (`dynamodb:Query` on the table + `global-index`,
-  `s3:GetObject` on the bucket). `teardown.sh` removes it.
+  policy: `dynamodb:Query` + `dynamodb:DeleteItem` on the table + `global-index`,
+  and `s3:GetObject` + `s3:DeleteObject` on the bucket (the Delete button needs
+  the two delete actions). `teardown.sh` removes it.
 - **Login + config travel in the task definition** as env vars, set once at
   deploy. The state file stays free of secrets.
 - **No `fix-image.sh`.** That script existed to migrate hrDemoWebApp off GHCR;

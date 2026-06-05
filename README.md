@@ -61,12 +61,12 @@ The IAM identity only ever needs:
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Effect": "Allow", "Action": ["dynamodb:Query"],
+    { "Effect": "Allow", "Action": ["dynamodb:Query", "dynamodb:DeleteItem"],
       "Resource": [
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME",
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME/index/global-index"
       ] },
-    { "Effect": "Allow", "Action": ["s3:GetObject"],
+    { "Effect": "Allow", "Action": ["s3:GetObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::BUCKET_NAME/*" }
   ]
 }

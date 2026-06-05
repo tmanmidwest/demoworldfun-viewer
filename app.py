@@ -114,14 +114,26 @@ def _row(m: dict) -> str:
         flag += " <span style='color:#b00'>[spam]</span>"
     if m.get("virusVerdict") == "FAIL":
         flag += " <span style='color:#b00'>[virus]</span>"
+    mid = html.escape(m["messageId"])
     return (
         "<tr>"
         f"<td>{html.escape(m.get('recipient', ''))}</td>"
         f"<td>{html.escape(m.get('sender', ''))}</td>"
-        f"<td><a href='/message/{html.escape(m['messageId'])}'>"
+        f"<td><a href='/message/{mid}'>"
         f"{html.escape(m.get('subject', '(no subject)'))}</a>{flag}</td>"
         f"<td>{html.escape(m.get('receivedAt', '').split('#')[0])}</td>"
+        f"<td>{_delete_button(mid)}</td>"
         "</tr>"
+    )
+
+
+def _delete_button(message_id: str) -> str:
+    # A small POST form. Confirm dialog guards against accidental clicks.
+    return (
+        f"<form method=post action='/message/{message_id}/delete' style='margin:0' "
+        "onsubmit=\"return confirm('Delete this message permanently?')\">"
+        "<button type=submit style='border:0;background:none;color:#b00;"
+        "cursor:pointer;font-size:13px;padding:0'>Delete</button></form>"
     )
 
 
@@ -145,7 +157,7 @@ PAGE = """<!doctype html><meta charset=utf-8>
 {nav}
 <h2>{title} &mdash; inbox{title_extra}</h2>
 <p class=muted>Auto-refreshes every 10s.</p>
-<table><tr><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th></tr>
+<table><tr><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr>
 {rows}</table>"""
 
 
@@ -220,7 +232,7 @@ def inbox_all():
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=4 class=muted>No mail yet.</td></tr>",
+        rows=rows or "<tr><td colspan=5 class=muted>No mail yet.</td></tr>",
         title_extra="",
     )
 
@@ -236,7 +248,7 @@ def inbox_for(address: str):
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=4 class=muted>No mail.</td></tr>",
+        rows=rows or "<tr><td colspan=5 class=muted>No mail.</td></tr>",
         title_extra=f" &mdash; {html.escape(address)}",
     )
 
@@ -274,6 +286,43 @@ def view_message(message_id: str):
     return (
         "<!doctype html><meta charset=utf-8>"
         "<body style='font:14px system-ui,sans-serif;margin:2rem'>"
-        "<a href='/'>&larr; inbox</a><hr>"
+        "<a href='/'>&larr; inbox</a>"
+        f"<span style='float:right'>{_delete_button(html.escape(message_id))}</span>"
+        "<hr>"
         f"{meta}{rendered}"
     )
+
+
+@app.post("/message/{message_id}/delete", dependencies=[Depends(require_login)])
+def delete_message(message_id: str):
+    """Permanently remove a message: the raw email in S3 and all index rows."""
+    # 1. Delete the raw email object from S3
+    try:
+        s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{message_id}")
+    except Exception:
+        pass  # already gone / expired — fall through to index cleanup
+
+    # 2. Delete every DynamoDB index row referencing this messageId.
+    #    A message may have one row per recipient. Walk the global feed
+    #    (small at demo volume) and delete matches.
+    start_key = None
+    while True:
+        kwargs = dict(
+            IndexName="global-index",
+            KeyConditionExpression=Key("inbox").eq("ALL"),
+        )
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.query(**kwargs)
+        for it in resp.get("Items", []):
+            if it.get("messageId") == message_id:
+                table.delete_item(Key={
+                    "recipient": it["recipient"],
+                    "receivedAt": it["receivedAt"],
+                })
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    # 303 -> browser re-requests the inbox with GET
+    return RedirectResponse("/", status_code=303)
