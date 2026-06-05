@@ -15,8 +15,6 @@ set -euo pipefail
 
 # ── Defaults (override at the prompts) ────────────────────────────────────────
 DEFAULT_DOMAIN="demoworldfun.net"
-DEFAULT_BUCKET="demoworldfun-inbound-mail"
-DEFAULT_TABLE="demoworldfun-messages"
 DEFAULT_PREFIX="inbox/"
 DEFAULT_RETENTION="30"
 # Fixed resource names (one backend per account; matches the viewer suite)
@@ -24,6 +22,10 @@ RULESET="demoworldfun-rules"
 RULE="catch-all"
 LAMBDA_FN="demoworldfun-index"
 ROLE="demoworldfun-index-role"
+
+# Derive a clean resource slug from a domain: first label, lowercased, sanitized.
+# e.g. demoworldfun.net -> demoworldfun ; My-Company.io -> my-company
+slugify() { echo "$1" | cut -d. -f1 | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-*//; s/-*$//'; }
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 CHECKMARK="${GREEN}✔${NC}"; ARROW="${BLUE}▶${NC}"; WARNING="${YELLOW}⚠${NC}"
@@ -50,8 +52,13 @@ command -v zip >/dev/null 2>&1 || error "zip not found (needed to package the La
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 header "Configuration"
 read -rp "  Domain to receive mail for  [$DEFAULT_DOMAIN]: " DOMAIN;   DOMAIN="${DOMAIN:-$DEFAULT_DOMAIN}"
-read -rp "  S3 bucket name              [$DEFAULT_BUCKET]: " BUCKET;   BUCKET="${BUCKET:-$DEFAULT_BUCKET}"
-read -rp "  DynamoDB table name         [$DEFAULT_TABLE]: " TABLE;     TABLE="${TABLE:-$DEFAULT_TABLE}"
+# Suggest the remaining names from the domain (override any of them at the prompt)
+SLUG=$(slugify "$DOMAIN"); [ -n "$SLUG" ] || error "Couldn't derive a name from '$DOMAIN'."
+DEF_BUCKET="${SLUG}-inbound-mail"
+DEF_TABLE="${SLUG}-messages"
+echo -e "  ${ARROW}  Suggesting names from '${DOMAIN}' (press Enter to accept, or type your own)"
+read -rp "  S3 bucket name              [$DEF_BUCKET]: " BUCKET;   BUCKET="${BUCKET:-$DEF_BUCKET}"
+read -rp "  DynamoDB table name         [$DEF_TABLE]: " TABLE;     TABLE="${TABLE:-$DEF_TABLE}"
 read -rp "  S3 key prefix               [$DEFAULT_PREFIX]: " PREFIX;   PREFIX="${PREFIX:-$DEFAULT_PREFIX}"
 while :; do
   read -rp "  Retention (days, applies to messages + raw email) [$DEFAULT_RETENTION]: " RETENTION

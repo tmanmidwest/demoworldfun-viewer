@@ -32,8 +32,10 @@ chmod +x setup.sh deploy.sh manage.sh update.sh teardown.sh restore-state.sh
 ./deploy.sh    # builds from GitHub, pushes to your ECR, stands up ALB + Fargate
 ```
 
-`deploy.sh` prompts for the table name, bucket name, S3 prefix, app title, and
-an optional login (username + password). It verifies the backend exists before
+`deploy.sh` asks for your domain first and suggests the table name, bucket name,
+and app title from it (e.g. `acme.com` → `acme-messages` / `acme-inbound-mail`);
+you can override any of them. It then asks for the S3 prefix and an optional
+login (username + password). It verifies the backend exists before
 building anything, prints your URL when done, and writes a
 `.demoworldfun-viewer-state` file tracking your resource IDs.
 

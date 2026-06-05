@@ -14,10 +14,12 @@ set -euo pipefail
 # ── Constants you can change ──────────────────────────────────────────────────
 APP_NAME="demoworldfun-viewer"
 GITHUB_REPO="https://github.com/tmanmidwest/demoworldfun-viewer.git"
-DEFAULT_TABLE="demoworldfun-messages"
-DEFAULT_BUCKET="demoworldfun-inbound-mail"
+DEFAULT_DOMAIN="demoworldfun.net"
 DEFAULT_PREFIX="inbox/"
-DEFAULT_TITLE="demoworldfun.net"
+
+# Derive a clean resource slug from a domain: first label, lowercased, sanitized.
+# Must match the backend's build.sh so the names line up.
+slugify() { echo "$1" | cut -d. -f1 | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-*//; s/-*$//'; }
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 CHECKMARK="${GREEN}✔${NC}"; ARROW="${BLUE}▶${NC}"; WARNING="${YELLOW}⚠${NC}"
@@ -59,10 +61,15 @@ success "Docker and Git ready"
 
 # ── CONFIG PROMPTS ────────────────────────────────────────────────────────────
 header "Configuration"
-read -rp "  DynamoDB table  [$DEFAULT_TABLE]: " TABLE_NAME;  TABLE_NAME="${TABLE_NAME:-$DEFAULT_TABLE}"
-read -rp "  S3 bucket       [$DEFAULT_BUCKET]: " BUCKET_NAME; BUCKET_NAME="${BUCKET_NAME:-$DEFAULT_BUCKET}"
+read -rp "  Domain          [$DEFAULT_DOMAIN]: " DOMAIN; DOMAIN="${DOMAIN:-$DEFAULT_DOMAIN}"
+SLUG=$(slugify "$DOMAIN"); [ -n "$SLUG" ] || error "Couldn't derive a name from '$DOMAIN'."
+DEF_TABLE="${SLUG}-messages"
+DEF_BUCKET="${SLUG}-inbound-mail"
+echo -e "  ${ARROW}  Suggesting names from '${DOMAIN}' — these must match your backend (override if needed)"
+read -rp "  DynamoDB table  [$DEF_TABLE]: " TABLE_NAME;  TABLE_NAME="${TABLE_NAME:-$DEF_TABLE}"
+read -rp "  S3 bucket       [$DEF_BUCKET]: " BUCKET_NAME; BUCKET_NAME="${BUCKET_NAME:-$DEF_BUCKET}"
 read -rp "  S3 prefix       [$DEFAULT_PREFIX]: " S3_PREFIX;   S3_PREFIX="${S3_PREFIX:-$DEFAULT_PREFIX}"
-read -rp "  App title       [$DEFAULT_TITLE]: " APP_TITLE;    APP_TITLE="${APP_TITLE:-$DEFAULT_TITLE}"
+read -rp "  App title       [$DOMAIN]: " APP_TITLE;    APP_TITLE="${APP_TITLE:-$DOMAIN}"
 
 # Verify the backend exists before doing anything expensive
 log "Verifying backend resources exist in $REGION..."

@@ -39,8 +39,9 @@ chmod +x setup.sh build.sh teardown.sh
 `build.sh` prompts for:
 
 - **Domain** (default `demoworldfun.net`)
-- **Bucket** / **Table** names (defaults `demoworldfun-inbound-mail` /
-  `demoworldfun-messages` — these must match what the viewer is pointed at)
+- **Bucket** / **Table** names — suggested from the domain you enter
+  (e.g. `acme.com` → `acme-inbound-mail` / `acme-messages`); override if you
+  like, but they must match what the viewer is pointed at
 - **S3 prefix** (default `inbox/`)
 - **Retention in days** (default `30`) — applied to *both* the DynamoDB TTL and
   the S3 lifecycle rule, so indexed messages and raw emails expire together
