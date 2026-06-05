@@ -1,61 +1,103 @@
 # demoworldfun inbox viewer
 
-A small, portable web viewer for the catch-all inbox on `demoworldfun.net`.
-It lists inbound emails (indexed in DynamoDB) and renders message bodies
-(stored in S3 by Amazon SES).
+A small, portable web viewer for a catch-all SES inbox. It lists inbound emails
+(indexed in DynamoDB) and renders message bodies (stored in S3 by Amazon SES).
 
-The whole point of this repo: **the container is the unit of deployment.**
-Build the image once and run the *same artifact* anywhere — your Mac, homelab
-Docker, or AWS — with no code changes. Where it runs is just a config decision
-you can change any time.
+Built to be cloned and run by anyone: **every operational setting is an
+environment variable**, the same container image runs locally, on Docker, or on
+AWS unchanged, and an optional login is built in.
+
+> This repo is just the viewer app. The AWS backend it reads from (SES receiving
+> rule, S3 bucket, DynamoDB table + `global-index`, and the indexer Lambda) is
+> assumed to already exist. Point the app at your own resources via env vars.
 
 ## Repo layout
 
 ```
-app.py               FastAPI viewer (+ optional built-in basic auth)
+app.py               FastAPI viewer + optional session login
+hash_password.py     Generates the password-hash value for .env
 requirements.txt     Pinned Python deps
 Dockerfile           python:3.12-slim, non-root, with healthcheck
 docker-compose.yml   For local / homelab runs
 .env.example         Copy to .env and fill in
-.dockerignore
-.gitignore
+.dockerignore / .gitignore
 ```
 
 ## Configuration
 
 Everything is environment-driven. Copy `.env.example` to `.env` and fill it in.
 
-| Variable | Purpose |
-|---|---|
-| `AWS_DEFAULT_REGION` | `us-east-1` |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Only for local/Docker. **Leave blank on AWS** and use a role. |
-| `TABLE_NAME` | `demoworldfun-messages` |
-| `BUCKET_NAME` | `demoworldfun-inbound-mail` |
-| `S3_PREFIX` | `inbox/` |
-| `AUTH_USER` / `AUTH_PASS` | Set both to require login. Leave blank to disable auth. |
-| `HOST_PORT` | Host port for compose (default `8100`). |
+| Variable | Required | Purpose |
+|---|---|---|
+| `AWS_DEFAULT_REGION` | yes | e.g. `us-east-1` |
+| `TABLE_NAME` | yes | DynamoDB table (e.g. `demoworldfun-messages`) |
+| `BUCKET_NAME` | yes | S3 bucket with the raw emails |
+| `S3_PREFIX` | no | Key prefix SES writes under (default `inbox/`) |
+| `APP_TITLE` | no | Branding shown in the header/login (default `inbox`) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | local only | **Leave blank on AWS**; use a role instead |
+| `AUTH_USER` | for login | Login username |
+| `AUTH_PASS_HASH_B64` | for login | Base64 bcrypt hash from `hash_password.py` |
+| `SESSION_SECRET` | for login | Random string signing the session cookie |
+| `SECURE_COOKIES` | no | `true` when served over HTTPS |
+| `HOST_PORT` | compose only | Host port (default `8100`) |
 
-### How credentials work (the portable bit)
+## How AWS credentials work (important)
 
-The app never hard-codes credentials. It uses the standard boto3 chain:
+**Credentials are supplied at deploy time, never through the UI.** The app uses
+the standard boto3 chain and resolves them automatically:
 
-- **Local / Docker:** the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` you
-  put in `.env` (use the scoped read-only `demoworldfun-viewer` IAM user —
-  it can only `dynamodb:Query` the table + index and `s3:GetObject` the bucket).
-- **On AWS:** attach an instance/task role with that same read-only policy and
-  leave the key variables blank. The SDK picks the role up automatically.
+- **Local / Docker:** put the scoped read-only keys in `.env`
+  (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+- **On AWS (App Runner / ECS):** attach an instance/task role carrying the
+  read-only policy and **leave the key variables blank** — no keys travel with
+  the app at all.
 
-Same image, same code — only the credential source differs.
+This is deliberate. A viewer that accepted AWS keys through a form would have to
+store them, encrypt them at rest, and would push people toward long-lived keys
+over roles. Keeping credentials at the deployment boundary avoids all of that.
+The IAM identity only ever needs:
 
-### Auth
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["dynamodb:Query"],
+      "Resource": [
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME/index/global-index"
+      ] },
+    { "Effect": "Allow", "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::BUCKET_NAME/*" }
+  ]
+}
+```
 
-Auth is built into the app so it travels with the container. Set `AUTH_USER`
-and `AUTH_PASS` to turn on an HTTP basic login on all view routes. Leave them
-blank to disable (e.g. when you front it with Authentik or Cognito). `/healthz`
-is always unauthenticated for health probes.
+## Setting up the login
 
-> Basic auth is intentionally minimal and dependency-free. If you want a nicer
-> cookie-based login form later, that's a small swap — ask and I'll add it.
+Login is optional. It turns on only when `AUTH_USER` **and** `AUTH_PASS_HASH_B64`
+are both set; if you front the app with Authentik / Cognito / another proxy,
+leave them blank to disable the built-in login entirely.
+
+To enable it:
+
+```bash
+# 1. Generate the password hash (prompts for the password, hidden)
+python3 hash_password.py
+#    -> prints: AUTH_PASS_HASH_B64=....
+
+# 2. Generate a session secret
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Put `AUTH_USER`, the printed `AUTH_PASS_HASH_B64` line, and `SESSION_SECRET` in
+`.env`. Notes:
+
+- The hash is **base64-encoded** so it contains no `$` characters — that avoids
+  the shell and docker-compose trying to interpolate it out of `.env`.
+- No plaintext password is stored anywhere; only the bcrypt hash.
+- It's a single account by design. Rotating the password = regenerate the hash
+  and redeploy.
+- Set `SECURE_COOKIES=true` whenever the app is served over HTTPS.
 
 ## Run it
 
@@ -78,10 +120,10 @@ docker compose up -d --build
 # http://<host>:8100
 ```
 
-### Build a portable multi-arch image (no more "Mac vs Linux")
+### Build a portable multi-arch image (no "Mac vs Linux")
 
-Your Mac is arm64; most servers and Fargate are amd64. `buildx` builds both at
-once so the image runs anywhere:
+Your Mac is arm64; servers and Fargate are amd64. `buildx` builds both so one
+image runs anywhere:
 
 ```bash
 docker buildx create --use --name multiarch    # one-time
@@ -89,21 +131,15 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t <your-registry>/demoworldfun-viewer:latest --push .
 ```
 
-Push to whatever registry you like — GitLab CR, GHCR, or ECR (below).
-
 ## Host it on AWS
 
-You don't need to commit to one AWS service. Two good options, easiest first:
+The container is the unit of deployment — pick a service, the image and env
+contract stay identical.
 
-### Option 1 — App Runner (simplest "set it and forget it")
-
-App Runner takes a container image and gives you an autoscaling HTTPS URL with
-no VPC, load balancer, or cluster to manage.
+### App Runner (simplest)
 
 ```bash
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-# 1. Create an ECR repo and push the image
 aws ecr create-repository --repository-name demoworldfun-viewer
 aws ecr get-login-password --region us-east-1 \
   | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
@@ -111,40 +147,21 @@ docker buildx build --platform linux/amd64 \
   -t ${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/demoworldfun-viewer:latest --push .
 ```
 
-Then in the App Runner console: create a service from that ECR image, set the
-port to `8000`, add the env vars (`TABLE_NAME`, `BUCKET_NAME`, `AUTH_USER`,
-`AUTH_PASS` — **not** the AWS keys), set the health check path to `/healthz`,
-and assign an **instance role** carrying the read-only policy below. You get a
-stable `https://...awsapprunner.com` URL out of the box.
+Then create an App Runner service from that image: port `8000`, health check
+path `/healthz`, add the env vars (`TABLE_NAME`, `BUCKET_NAME`, `APP_TITLE`,
+and the `AUTH_*` / `SESSION_SECRET` trio — **not** the AWS keys), assign an
+**instance role** with the read-only policy above, and set `SECURE_COOKIES=true`.
+You get a stable HTTPS URL out of the box.
 
-### Option 2 — ECS Fargate
+### ECS Fargate
 
-More control (your VPC, an ALB, custom domain), more setup. Use this if you
-outgrow App Runner. The image and env contract are identical; only the
-surrounding infrastructure differs.
-
-### The read-only role/policy (either option)
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": ["dynamodb:Query"],
-      "Resource": [
-        "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/demoworldfun-messages",
-        "arn:aws:dynamodb:us-east-1:ACCOUNT_ID:table/demoworldfun-messages/index/global-index"
-      ] },
-    { "Effect": "Allow", "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::demoworldfun-inbound-mail/*" }
-  ]
-}
-```
+More control (your VPC, an ALB, custom domain), more setup. Same image and env.
 
 ## Putting it in a repo
 
 ```bash
 git init && git add . && git commit -m "demoworldfun inbox viewer"
-git remote add origin <your gitlab/github remote>
+git remote add origin <remote>
 git push -u origin main
 ```
 
