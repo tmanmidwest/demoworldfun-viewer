@@ -1,2 +1,3 @@
 .DS_Store
 deploy_to_aws/backend/.demoworldfun-backend-state
+deploy_to_aws/.demoworldfun-viewer-state
