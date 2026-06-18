@@ -107,13 +107,18 @@ If you know that suite, the differences here are:
 
 ## Notes
 
-- The ALB listener is plain **HTTP:80**. For HTTPS, add an ACM cert + a 443
-  listener and set `SECURE_COOKIES=true` on the task (so the session cookie is
-  marked Secure). The login still works over HTTP for internal/demo use.
-- The session secret is stored inline in the task definition. For stricter
-  setups, move `SESSION_SECRET` / `AUTH_PASS_HASH_B64` into SSM Parameter Store
-  (SecureString) and reference them via the task def `secrets` block — the
-  execution role then needs `ssm:GetParameters`.
+- The ALB listener is plain **HTTP:80** out of the box. SSO/OAuth really wants
+  **HTTPS** — the authorization code and tokens travel over this URL. Run
+  **`./enable-https.sh <hostname>`** to add an ACM cert + 443 listener, redirect
+  80→443, and lock the ALB to Cloudflare's IP ranges. It's a custom domain
+  (you can't get an ACM cert for the raw `*.elb.amazonaws.com` name); the script
+  prints the Cloudflare DNS + SSL steps to finish. Then register the
+  `https://…/auth/callback` redirect URI in Authentik and re-run `deploy.sh`
+  with the `https://` callback base (it sets `SECURE_COOKIES=true` for you).
+- The session secret and **OIDC client secret** are stored inline in the task
+  definition. For stricter setups, move `SESSION_SECRET` / `OIDC_CLIENT_SECRET`
+  into SSM Parameter Store (SecureString) and reference them via the task def
+  `secrets` block — the execution role then needs `ssm:GetParameters`.
 - One deployment per account/region is assumed (resources are looked up by
   name), matching the isolation model.
 
@@ -123,6 +128,7 @@ If you know that suite, the differences here are:
 |---|---|
 | `setup.sh` | Check prerequisites + that the backend exists |
 | `deploy.sh` | Full deployment from scratch |
+| `enable-https.sh` | Add ACM cert + ALB :443, redirect 80→443, lock to Cloudflare IPs |
 | `manage.sh` | stop / start / restart / logs / status / url |
 | `update.sh` | Rebuild from GitHub and redeploy |
 | `restore-state.sh` | Rebuild the state file from AWS (second machine) |

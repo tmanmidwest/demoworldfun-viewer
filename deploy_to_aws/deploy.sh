@@ -112,33 +112,36 @@ aws s3api head-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1 \
 success "Backend verified: table + bucket reachable"
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
-header "Login"
-AUTH_USER=""; AUTH_PASS_HASH_B64=""; SESSION_SECRET=""
-echo -e "  This deploys a ${BOLD}public URL${NC}. A login is strongly recommended."
-read -rp "  Set up a login? [Y/n] " want_auth; want_auth="${want_auth:-Y}"
+header "Login (OIDC / Authentik SSO)"
+OIDC_DISCOVERY_URL=""; OIDC_CLIENT_ID=""; OIDC_CLIENT_SECRET=""
+OIDC_REDIRECT_URI=""; OIDC_ALLOWED_GROUPS=""; SESSION_SECRET=""; AUTH_DISABLED=""
+echo -e "  This deploys a ${BOLD}public URL${NC}. SSO login is strongly recommended."
+read -rp "  Set up SSO login? [Y/n] " want_auth; want_auth="${want_auth:-Y}"
 if [[ "$want_auth" =~ ^[Yy]$ ]]; then
-  read -rp "  Username [admin]: " AUTH_USER; AUTH_USER="${AUTH_USER:-admin}"
-  while :; do
-    read -rsp "  Password: " p1; echo
-    read -rsp "  Confirm:  " p2; echo
-    [ -n "$p1" ] && [ "$p1" = "$p2" ] && break
-    warn "Passwords empty or didn't match — try again."
-  done
-  log "Generating password hash..."
-  if python3 -c "import bcrypt" >/dev/null 2>&1; then
-    AUTH_PASS_HASH_B64=$(PW="$p1" python3 -c "import os,bcrypt,base64; print(base64.b64encode(bcrypt.hashpw(os.environ['PW'].encode(), bcrypt.gensalt())).decode())")
-  else
-    log "bcrypt not installed locally — hashing inside a container instead..."
-    AUTH_PASS_HASH_B64=$(PW="$p1" docker run --rm -e PW python:3.12-slim sh -c \
-      'pip install --quiet bcrypt >/dev/null 2>&1 && python -c "import os,bcrypt,base64; print(base64.b64encode(bcrypt.hashpw(os.environ[\"PW\"].encode(), bcrypt.gensalt())).decode())"')
-  fi
-  unset p1 p2
+  echo -e "  Create an OAuth2/OpenID provider + application in Authentik first."
+  read -rp "  OIDC discovery URL (…/.well-known/openid-configuration): " OIDC_DISCOVERY_URL
+  read -rp "  OIDC client ID: " OIDC_CLIENT_ID
+  read -rsp "  OIDC client secret: " OIDC_CLIENT_SECRET; echo
+  read -rp "  Allowed groups (comma-separated, blank = any user): " OIDC_ALLOWED_GROUPS
+  read -rp "  App callback base URL (e.g. http://your-alb-dns or https://host): " base_url
+  base_url="${base_url%/}"
+  [ -n "$base_url" ] && OIDC_REDIRECT_URI="${base_url}/auth/callback"
   SESSION_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-  success "Login configured for user '$AUTH_USER' (only the bcrypt hash is stored)"
+  [ -n "$OIDC_DISCOVERY_URL" ] && [ -n "$OIDC_CLIENT_ID" ] && [ -n "$OIDC_CLIENT_SECRET" ] \
+    || error "OIDC discovery URL, client ID, and client secret are all required."
+  [ -n "$OIDC_REDIRECT_URI" ] \
+    || error "Callback base URL is required so the redirect URI matches Authentik."
+  success "SSO configured (redirect URI: $OIDC_REDIRECT_URI)"
 else
+  AUTH_DISABLED="true"
   warn "No login — the viewer will be open to anyone with the URL. Dummy data only!"
 fi
-SECURE_COOKIES="false"   # ALB listener is HTTP:80 in this script; set true if you add HTTPS
+# ALB listener is HTTP:80 in this script. OAuth really wants HTTPS: if your
+# callback base URL is https://, set this to true (and add an HTTPS listener).
+case "$OIDC_REDIRECT_URI" in
+  https://*) SECURE_COOKIES="true" ;;
+  *)         SECURE_COOKIES="false" ;;
+esac
 
 # ── NETWORKING ────────────────────────────────────────────────────────────────
 header "Networking (default VPC)"
@@ -273,11 +276,13 @@ aws ecs create-cluster --cluster-name "$APP_NAME" --region "$REGION" >/dev/null 
 log "Registering task definition (with task role + env)..."
 export FAMILY EXEC_ROLE_ARN TASK_ROLE_ARN CONTAINER IMAGE LOG_GROUP REGION \
        AWS_DEFAULT_REGION="$REGION" TABLE_NAME BUCKET_NAME S3_PREFIX APP_TITLE \
-       AUTH_USER AUTH_PASS_HASH_B64 SESSION_SECRET SECURE_COOKIES
+       OIDC_DISCOVERY_URL OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_REDIRECT_URI \
+       OIDC_ALLOWED_GROUPS SESSION_SECRET AUTH_DISABLED SECURE_COOKIES
 python3 - > "${BUILD_DIR}/taskdef.json" <<'PY'
 import json, os
 keys = ["AWS_DEFAULT_REGION","TABLE_NAME","BUCKET_NAME","S3_PREFIX","APP_TITLE",
-        "AUTH_USER","AUTH_PASS_HASH_B64","SESSION_SECRET","SECURE_COOKIES"]
+        "OIDC_DISCOVERY_URL","OIDC_CLIENT_ID","OIDC_CLIENT_SECRET","OIDC_REDIRECT_URI",
+        "OIDC_ALLOWED_GROUPS","SESSION_SECRET","AUTH_DISABLED","SECURE_COOKIES"]
 td = {
   "family": os.environ["FAMILY"],
   "networkMode": "awsvpc",
@@ -371,7 +376,7 @@ echo -e "${BOLD}${GREEN}  Deployment complete!${NC}"
 echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}URL:${NC}  http://${ALB_DNS}/"
-[ -n "$AUTH_USER" ] && echo -e "  ${BOLD}Login:${NC}  user '${AUTH_USER}' (the password you just set)"
+[ -z "$AUTH_DISABLED" ] && echo -e "  ${BOLD}Login:${NC}  SSO via ${OIDC_DISCOVERY_URL}"
 echo ""
 echo -e "  Manage it with ${BOLD}./manage.sh status${NC}, update with ${BOLD}./update.sh${NC}."
 echo ""

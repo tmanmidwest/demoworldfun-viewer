@@ -7,22 +7,23 @@ all operational settings are environment variables, and AWS credentials are
 supplied at deploy time (env vars locally, or an instance/task role on AWS) --
 never entered through the UI.
 
-Auth: a single optional login account, defined entirely by environment
-variables. Enable it by setting AUTH_USER + AUTH_PASS_HASH_B64 + SESSION_SECRET.
-Leave them unset to disable login (e.g. when fronted by Authentik / Cognito).
+Auth: single sign-on via an OpenID Connect provider (e.g. Authentik). Configure
+it with OIDC_DISCOVERY_URL + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET + SESSION_SECRET
+and users log in through the provider's Authorization Code flow. Optionally
+restrict access to members of one or more provider groups via OIDC_ALLOWED_GROUPS.
+For local dev or when fronted by another auth proxy, set AUTH_DISABLED=true.
 """
 
 import os
 import html
-import base64
 import secrets
 
-import bcrypt
 import boto3
 from boto3.dynamodb.conditions import Key
 from email import message_from_bytes
 from email.policy import default as default_policy
-from fastapi import FastAPI, Depends, Request, Form
+from authlib.integrations.starlette_client import OAuth, OAuthError
+from fastapi import FastAPI, Depends, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -35,27 +36,53 @@ BUCKET_NAME = os.environ["BUCKET_NAME"]
 S3_PREFIX = os.environ.get("S3_PREFIX", "inbox/")
 APP_TITLE = os.environ.get("APP_TITLE", "inbox")  # shown in the UI header
 
-# Auth (optional). Auth turns on only when a user AND a password hash exist.
-AUTH_USER = os.environ.get("AUTH_USER")
-AUTH_PASS_HASH_B64 = os.environ.get("AUTH_PASS_HASH_B64")
+# Auth via OpenID Connect (Authentik). Disabled only with an explicit opt-out,
+# so the app fails closed if you forget to configure it.
+AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")
+AUTH_ENABLED = not AUTH_DISABLED
+
+OIDC_DISCOVERY_URL = os.environ.get("OIDC_DISCOVERY_URL")
+OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID")
+OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET")
+# Exact callback URL registered in Authentik. If unset, it is derived per
+# request -- but behind an ALB/proxy you should set it explicitly so the scheme
+# and host always match what the provider expects.
+OIDC_REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI")
+# Optional comma-separated allow-list of provider groups. Empty = any
+# authenticated user the provider lets through.
+OIDC_ALLOWED_GROUPS = [
+    g.strip() for g in os.environ.get("OIDC_ALLOWED_GROUPS", "").split(",") if g.strip()
+]
+
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 SECURE_COOKIES = os.environ.get("SECURE_COOKIES", "").lower() in ("1", "true", "yes")
 
-AUTH_ENABLED = bool(AUTH_USER and AUTH_PASS_HASH_B64)
+oauth = OAuth()
 
 if AUTH_ENABLED:
-    # The stored hash is base64-encoded to avoid '$' interpolation headaches
-    # in .env / docker-compose. Decode it back to the raw bcrypt hash bytes.
-    try:
-        _PW_HASH = base64.b64decode(AUTH_PASS_HASH_B64)
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("AUTH_PASS_HASH_B64 is not valid base64") from exc
-    if not SESSION_SECRET:
+    missing = [
+        name for name, val in (
+            ("OIDC_DISCOVERY_URL", OIDC_DISCOVERY_URL),
+            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
+            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
+            ("SESSION_SECRET", SESSION_SECRET),
+        ) if not val
+    ]
+    if missing:
         raise RuntimeError(
-            "Auth is enabled (AUTH_USER + AUTH_PASS_HASH_B64 set) but "
-            "SESSION_SECRET is missing. Generate one with:\n"
+            "OIDC auth is enabled but these are missing: "
+            + ", ".join(missing)
+            + ".\nSet them, or set AUTH_DISABLED=true to run without login.\n"
+            "Generate SESSION_SECRET with:\n"
             "  python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
         )
+    oauth.register(
+        name="oidc",
+        server_metadata_url=OIDC_DISCOVERY_URL,
+        client_id=OIDC_CLIENT_ID,
+        client_secret=OIDC_CLIENT_SECRET,
+        client_kwargs={"scope": "openid email profile"},
+    )
 
 # AWS credentials come from the standard boto3 chain -- env vars locally, or an
 # instance/task role on AWS. They are never read from or written to the UI.
@@ -92,17 +119,17 @@ def require_login(request: Request):
         raise NotAuthenticated()
 
 
-def _verify(username: str, password: str) -> bool:
-    if not AUTH_ENABLED:
-        return False
-    if not secrets.compare_digest(username, AUTH_USER):
-        # Run a dummy check anyway to keep timing roughly constant.
-        bcrypt.checkpw(b"x", bcrypt.hashpw(b"x", bcrypt.gensalt()))
-        return False
-    try:
-        return bcrypt.checkpw(password.encode("utf-8"), _PW_HASH)
-    except ValueError:
-        return False
+def _callback_uri(request: Request) -> str:
+    """The OIDC redirect URI: explicit env value, else derived from the request."""
+    return OIDC_REDIRECT_URI or str(request.url_for("auth_callback"))
+
+
+def _group_allowed(userinfo: dict) -> bool:
+    """True if no group restriction is set, or the user is in an allowed group."""
+    if not OIDC_ALLOWED_GROUPS:
+        return True
+    user_groups = userinfo.get("groups") or []
+    return any(g in OIDC_ALLOWED_GROUPS for g in user_groups)
 
 
 # ---------------------------------------------------------------------------
@@ -166,22 +193,17 @@ LOGIN_PAGE = """<!doctype html><meta charset=utf-8>
 <style>
  body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
        align-items:center;min-height:90vh;margin:0}}
- .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:280px}}
- h2{{margin:0 0 1rem}}
- input{{width:100%;padding:.5rem;margin:.3rem 0;box-sizing:border-box;
-        border:1px solid #ccc;border-radius:4px}}
- button{{width:100%;padding:.6rem;margin-top:.6rem;border:0;border-radius:4px;
-         background:#0645ad;color:#fff;font-size:14px;cursor:pointer}}
- .err{{color:#b00;font-size:13px;min-height:1.2em}}
+ .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:280px;
+        text-align:center}}
+ h2{{margin:0 0 1.2rem}}
+ a.btn{{display:block;padding:.6rem;border-radius:4px;background:#0645ad;
+        color:#fff;font-size:14px;text-decoration:none}}
+ .err{{color:#b00;font-size:13px;min-height:1.2em;margin-bottom:.4rem}}
 </style>
 <div class=card>
  <h2>{title}</h2>
- <form method=post action=/login>
-  <div class=err>{error}</div>
-  <input name=username placeholder=Username autofocus autocomplete=username>
-  <input name=password type=password placeholder=Password autocomplete=current-password>
-  <button type=submit>Log in</button>
- </form>
+ <div class=err>{error}</div>
+ <a class=btn href=/login>Sign in with SSO</a>
 </div>"""
 
 
@@ -194,24 +216,43 @@ def healthz():
     return "ok"
 
 
-@app.get("/login", response_class=HTMLResponse)
-def login_form(request: Request, error: str = ""):
+@app.get("/login")
+async def login(request: Request, error: str = ""):
+    """Start the OIDC Authorization Code flow (or show an error after a failure)."""
     if not AUTH_ENABLED or request.session.get("user"):
         return RedirectResponse("/", status_code=302)
-    msg = "Invalid username or password." if error else ""
-    return LOGIN_PAGE.format(title=html.escape(APP_TITLE), error=html.escape(msg))
+    if error:
+        messages = {
+            "denied": "Your account is not permitted to access this app.",
+            "failed": "Sign-in failed. Please try again.",
+        }
+        msg = messages.get(error, "Sign-in failed. Please try again.")
+        return HTMLResponse(
+            LOGIN_PAGE.format(title=html.escape(APP_TITLE), error=html.escape(msg))
+        )
+    return await oauth.oidc.authorize_redirect(request, _callback_uri(request))
 
 
-@app.post("/login")
-def login_submit(request: Request,
-                 username: str = Form(...),
-                 password: str = Form(...)):
+@app.get("/auth/callback", name="auth_callback")
+async def auth_callback(request: Request):
+    """OIDC redirect target: exchange the code, enforce group policy, log in."""
     if not AUTH_ENABLED:
         return RedirectResponse("/", status_code=302)
-    if _verify(username, password):
-        request.session["user"] = username
-        return RedirectResponse("/", status_code=302)
-    return RedirectResponse("/login?error=1", status_code=302)
+    try:
+        token = await oauth.oidc.authorize_access_token(request)
+    except OAuthError:
+        return RedirectResponse("/login?error=failed", status_code=302)
+
+    userinfo = token.get("userinfo") or {}
+    if not _group_allowed(userinfo):
+        return RedirectResponse("/login?error=denied", status_code=302)
+
+    request.session["user"] = (
+        userinfo.get("preferred_username")
+        or userinfo.get("email")
+        or userinfo.get("sub")
+    )
+    return RedirectResponse("/", status_code=302)
 
 
 @app.get("/logout")
