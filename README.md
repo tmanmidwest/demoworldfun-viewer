@@ -64,7 +64,7 @@ The IAM identity only ever needs:
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Effect": "Allow", "Action": ["dynamodb:Query", "dynamodb:DeleteItem"],
+    { "Effect": "Allow", "Action": ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       "Resource": [
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME",
         "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME/index/global-index"

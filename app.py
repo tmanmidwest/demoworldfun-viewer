@@ -17,6 +17,7 @@ For local dev or when fronted by another auth proxy, set AUTH_DISABLED=true.
 import os
 import html
 import secrets
+from urllib.parse import urlencode
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -142,12 +143,23 @@ def _row(m: dict) -> str:
     if m.get("virusVerdict") == "FAIL":
         flag += " <span style='color:#b00'>[virus]</span>"
     mid = html.escape(m["messageId"])
+    is_read = bool(m.get("read"))
+
+    # Carry this item's primary key in the link so opening it marks exactly
+    # this row read (no scan needed). receivedAt is the full sort key value.
+    qs = urlencode({"r": m.get("recipient", ""), "t": m.get("receivedAt", "")})
+    href = html.escape(f"/message/{m['messageId']}?{qs}", quote=True)
+
+    dot = ("<span title=read style='color:#bbb'>○</span>" if is_read
+           else "<span title=unread style='color:#0645ad'>●</span>")
+    subj = html.escape(m.get("subject", "(no subject)"))
+    subj_weight = "" if is_read else "font-weight:600"
     return (
-        "<tr>"
+        f"<tr class='{'read' if is_read else 'unread'}'>"
+        f"<td style='text-align:center'>{dot}</td>"
         f"<td>{html.escape(m.get('recipient', ''))}</td>"
         f"<td>{html.escape(m.get('sender', ''))}</td>"
-        f"<td><a href='/message/{mid}'>"
-        f"{html.escape(m.get('subject', '(no subject)'))}</a>{flag}</td>"
+        f"<td><a href='{href}' style='{subj_weight}'>{subj}</a>{flag}</td>"
         f"<td>{html.escape(m.get('receivedAt', '').split('#')[0])}</td>"
         f"<td>{_delete_button(mid)}</td>"
         "</tr>"
@@ -180,11 +192,13 @@ PAGE = """<!doctype html><meta charset=utf-8>
  th{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666}}
  a{{text-decoration:none;color:#0645ad}}
  .muted{{color:#888}}
+ tr.read td{{color:#999}}
+ tr.read a{{color:#7a93c0}}
 </style>
 {nav}
 <h2>{title} &mdash; inbox{title_extra}</h2>
 <p class=muted>Auto-refreshes every 10s.</p>
-<table><tr><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr>
+<table><tr><th></th><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr>
 {rows}</table>"""
 
 
@@ -301,7 +315,7 @@ def inbox_all():
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=5 class=muted>No mail yet.</td></tr>",
+        rows=rows or "<tr><td colspan=6 class=muted>No mail yet.</td></tr>",
         title_extra="",
     )
 
@@ -317,13 +331,27 @@ def inbox_for(address: str):
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=5 class=muted>No mail.</td></tr>",
+        rows=rows or "<tr><td colspan=6 class=muted>No mail.</td></tr>",
         title_extra=f" &mdash; {html.escape(address)}",
     )
 
 
 @app.get("/message/{message_id}", response_class=HTMLResponse, dependencies=[Depends(require_login)])
-def view_message(message_id: str):
+def view_message(message_id: str, r: str = "", t: str = ""):
+    # Best-effort: mark this inbox row read. 'r'/'t' are the item's primary key,
+    # carried from the inbox link. Needs dynamodb:UpdateItem; if the role lacks
+    # it (or the key wasn't passed) the view still renders fine.
+    if r and t:
+        try:
+            table.update_item(
+                Key={"recipient": r, "receivedAt": t},
+                UpdateExpression="SET #read = :true",
+                ExpressionAttributeNames={"#read": "read"},  # 'read' is reserved
+                ExpressionAttributeValues={":true": True},
+            )
+        except Exception:
+            pass
+
     key = f"{S3_PREFIX}{message_id}"
     raw = s3.get_object(Bucket=BUCKET_NAME, Key=key)["Body"].read()
     msg = message_from_bytes(raw, policy=default_policy)

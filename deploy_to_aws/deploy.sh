@@ -212,7 +212,7 @@ EXEC_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ecsTaskExecutionRole"
 success "Execution role: ecsTaskExecutionRole"
 
 # Task role (what the RUNNING container uses) — scoped read-only to this data
-log "Creating/updating task role with DynamoDB + S3 access (read + delete)..."
+log "Creating/updating task role with DynamoDB + S3 access (read + mark-read + delete)..."
 aws iam get-role --role-name "$TASK_ROLE_NAME" >/dev/null 2>&1 || \
   aws iam create-role --role-name "$TASK_ROLE_NAME" \
     --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
@@ -220,7 +220,7 @@ aws iam get-role --role-name "$TASK_ROLE_NAME" >/dev/null 2>&1 || \
 cat > "${BUILD_DIR}/task-policy.json" <<EOF
 { "Version": "2012-10-17",
   "Statement": [
-    { "Effect": "Allow", "Action": ["dynamodb:Query", "dynamodb:DeleteItem"],
+    { "Effect": "Allow", "Action": ["dynamodb:Query", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
       "Resource": [
         "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${TABLE_NAME}",
         "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${TABLE_NAME}/index/global-index"
