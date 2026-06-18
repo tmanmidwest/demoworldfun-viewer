@@ -31,6 +31,38 @@ warn()    { echo -e "${WARNING}  ${YELLOW}$1${NC}"; }
 error()   { echo -e "${RED}✖  ERROR: $1${NC}" >&2; exit 1; }
 header()  { echo -e "\n${BOLD}${BLUE}── $1 ${NC}"; }
 
+# Idempotently ensure a CloudWatch log group exists. Fails loudly if it can't
+# be created — a missing log group makes ECS tasks fail to start (the awslogs
+# driver does NOT auto-create the group), which is hard to diagnose otherwise.
+ensure_log_group() {
+  local group="$1"
+
+  if aws logs describe-log-groups \
+      --log-group-name-prefix "$group" \
+      --region "$REGION" \
+      --query "logGroups[?logGroupName=='${group}'] | [0].logGroupName" \
+      --output text 2>/dev/null | grep -qx "$group"; then
+    return 0
+  fi
+
+  local create_err
+  if ! create_err=$(aws logs create-log-group \
+      --log-group-name "$group" \
+      --region "$REGION" 2>&1); then
+    if echo "$create_err" | grep -q "ResourceAlreadyExistsException"; then
+      return 0
+    fi
+    error "Could not create CloudWatch log group '$group': $create_err"
+  fi
+
+  aws logs describe-log-groups \
+    --log-group-name-prefix "$group" \
+    --region "$REGION" \
+    --query "logGroups[?logGroupName=='${group}'] | [0].logGroupName" \
+    --output text 2>/dev/null | grep -qx "$group" \
+    || error "Log group '$group' still does not exist after creation attempt."
+}
+
 SERVICE="${APP_NAME}-web"
 FAMILY="${APP_NAME}-web"
 CONTAINER="${APP_NAME}-web"
@@ -201,7 +233,9 @@ TASK_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${TASK_ROLE_NAME}"
 success "Task role: $TASK_ROLE_NAME"
 
 # ── LOG GROUP ─────────────────────────────────────────────────────────────────
-aws logs create-log-group --log-group-name "$LOG_GROUP" --region "$REGION" >/dev/null 2>&1 || true
+header "CloudWatch log group"
+ensure_log_group "$LOG_GROUP"
+success "Log group: $LOG_GROUP"
 
 # ── LOAD BALANCER ─────────────────────────────────────────────────────────────
 header "Application Load Balancer"
