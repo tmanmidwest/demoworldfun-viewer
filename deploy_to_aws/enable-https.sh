@@ -189,22 +189,21 @@ fi
 warn "Direct ALB access over the raw *.elb.amazonaws.com name will now fail — that's intended; reach the app through Cloudflare."
 
 # ── Next steps ────────────────────────────────────────────────────────────────
+# Use echo -e (not a heredoc) so the ${BOLD}/${NC} escape codes are interpreted.
 header "Done — finish in Cloudflare + redeploy"
-cat <<EOF
-
-  ${BOLD}1. Cloudflare DNS${NC}
-     Add a record:  ${BOLD}${HOST%%.*}${NC} → CNAME → ${BOLD}${ALB_DNS}${NC}  (Proxied / orange cloud)
-
-  ${BOLD}2. Cloudflare SSL/TLS${NC}
-     Set the zone's encryption mode to ${BOLD}Full (strict)${NC}.
-
-  ${BOLD}3. Authentik${NC}
-     Set the provider's redirect URI to:  ${BOLD}https://${HOST}/auth/callback${NC}
-
-  ${BOLD}4. Redeploy the app${NC}
-     Re-run ./deploy.sh and give it ${BOLD}https://${HOST}${NC} as the callback base URL.
-     (That sets OIDC_REDIRECT_URI and flips SECURE_COOKIES=true.)
-
-  Then browse to:  ${BOLD}https://${HOST}/${NC}
-
-EOF
+echo ""
+echo -e "  ${BOLD}1. Cloudflare DNS${NC}"
+echo -e "     Add a record:  ${BOLD}${HOST%%.*}${NC} → CNAME → ${BOLD}${ALB_DNS}${NC}  (Proxied / orange cloud)"
+echo ""
+echo -e "  ${BOLD}2. Cloudflare SSL/TLS${NC}"
+echo -e "     Set the zone's encryption mode to ${BOLD}Full (strict)${NC}."
+echo ""
+echo -e "  ${BOLD}3. Authentik${NC}"
+echo -e "     Set the provider's redirect URI to:  ${BOLD}https://${HOST}/auth/callback${NC}"
+echo ""
+echo -e "  ${BOLD}4. Redeploy the app${NC}"
+echo -e "     Re-run ./deploy.sh and give it ${BOLD}https://${HOST}${NC} as the callback base URL."
+echo -e "     (That sets OIDC_REDIRECT_URI and flips SECURE_COOKIES=true.)"
+echo ""
+echo -e "  Then browse to:  ${BOLD}https://${HOST}/${NC}"
+echo ""
