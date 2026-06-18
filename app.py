@@ -207,6 +207,25 @@ LOGIN_PAGE = """<!doctype html><meta charset=utf-8>
 </div>"""
 
 
+LOGGED_OUT_PAGE = """<!doctype html><meta charset=utf-8>
+<title>{title} &mdash; signed out</title>
+<style>
+ body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
+       align-items:center;min-height:90vh;margin:0}}
+ .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:280px;
+        text-align:center}}
+ h2{{margin:0 0 .4rem}}
+ p{{color:#666;margin:0 0 1.2rem}}
+ a.btn{{display:block;padding:.6rem;border-radius:4px;background:#0645ad;
+        color:#fff;font-size:14px;text-decoration:none}}
+</style>
+<div class=card>
+ <h2>{title}</h2>
+ <p>You've been signed out of this app.</p>
+ <a class=btn href=/login>Sign in again</a>
+</div>"""
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -257,8 +276,17 @@ async def auth_callback(request: Request):
 
 @app.get("/logout")
 def logout(request: Request):
+    # Clear this app's session, then land on a static page instead of /login --
+    # otherwise /login would immediately re-launch the OIDC flow and the still-
+    # live SSO session would sign the user straight back in. The provider's own
+    # session is intentionally left intact (local logout only).
     request.session.clear()
-    return RedirectResponse("/login", status_code=302)
+    return RedirectResponse("/logged-out", status_code=302)
+
+
+@app.get("/logged-out", response_class=HTMLResponse, name="logged_out")
+def logged_out():
+    return LOGGED_OUT_PAGE.format(title=html.escape(APP_TITLE))
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
