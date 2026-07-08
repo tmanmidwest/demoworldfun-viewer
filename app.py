@@ -183,6 +183,7 @@ def _nav() -> str:
 
 
 PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="10">
 <title>{title} inbox</title>
 <style>
@@ -194,15 +195,33 @@ PAGE = """<!doctype html><meta charset=utf-8>
  .muted{{color:#888}}
  tr.read td{{color:#999}}
  tr.read a{{color:#7a93c0}}
+ /* Phone: reflow each table row into a stacked card (sender + subject
+    prominent; recipient/date/delete secondary). Desktop table unchanged. */
+ @media (max-width:600px){{
+  body{{margin:1rem}}
+  thead{{display:none}}
+  table,tbody,tr,td{{display:block}}
+  tr{{display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem .5rem;
+      border:1px solid #ddd;border-radius:8px;padding:.6rem .7rem;margin-bottom:.6rem}}
+  td{{border:0;padding:0}}
+  td:nth-child(1){{order:1}}                                   /* read dot */
+  td:nth-child(3){{order:2;flex:1;font-weight:600}}            /* From */
+  td:nth-child(5){{order:3;color:#888;font-size:12px}}         /* Received */
+  td:nth-child(4){{order:4;width:100%}}                        /* Subject */
+  td:nth-child(2){{order:5;color:#888;font-size:12px}}         /* To */
+  td:nth-child(2)::before{{content:'to: '}}
+  td:nth-child(6){{order:6;margin-left:auto}}                  /* Delete */
+ }}
 </style>
 {nav}
 <h2>{title} &mdash; inbox{title_extra}</h2>
 <p class=muted>Auto-refreshes every 10s.</p>
-<table><tr><th></th><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr>
-{rows}</table>"""
+<table><thead><tr><th></th><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table>"""
 
 
 LOGIN_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} &mdash; log in</title>
 <style>
  body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
@@ -222,6 +241,7 @@ LOGIN_PAGE = """<!doctype html><meta charset=utf-8>
 
 
 LOGGED_OUT_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} &mdash; signed out</title>
 <style>
  body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
@@ -370,19 +390,27 @@ def view_message(message_id: str, r: str = "", t: str = ""):
     )
 
     if is_html:
-        # Render untrusted email HTML inside a sandboxed iframe:
-        # no scripts, no same-origin access. Do not relax this.
-        srcdoc = html.escape(content, quote=True)
+        # Render untrusted email HTML inside a sandboxed iframe. Scripts and
+        # same-origin access stay OFF -- the email still can't run code or read
+        # this app's session. We allow ONLY popups, so links open in a new tab:
+        #   - allow-popups                    -> target=_blank links can open
+        #   - allow-popups-to-escape-sandbox  -> the opened tab is a normal page
+        # A prepended <base target=_blank> makes every link open in a new tab,
+        # even ones the email didn't tag (modern browsers imply rel=noopener).
+        srcdoc = html.escape('<base target="_blank">' + content, quote=True)
         rendered = (
-            "<iframe sandbox style='width:100%;height:70vh;border:1px solid #ccc' "
+            "<iframe sandbox='allow-popups allow-popups-to-escape-sandbox' "
+            "style='width:100%;height:70vh;border:1px solid #ccc' "
             f"srcdoc=\"{srcdoc}\"></iframe>"
         )
     else:
-        rendered = f"<pre style='white-space:pre-wrap'>{html.escape(content)}</pre>"
+        rendered = f"<pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{html.escape(content)}</pre>"
 
     return (
         "<!doctype html><meta charset=utf-8>"
-        "<body style='font:14px system-ui,sans-serif;margin:2rem'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<body style='font:14px system-ui,sans-serif;margin:2rem;overflow-wrap:anywhere'>"
+        "<style>@media(max-width:600px){body{margin:1rem}}</style>"
         "<a href='/'>&larr; inbox</a>"
         f"<span style='float:right'>{_delete_button(html.escape(message_id))}</span>"
         "<hr>"
