@@ -397,7 +397,29 @@ def view_message(message_id: str, r: str = "", t: str = ""):
         #   - allow-popups-to-escape-sandbox  -> the opened tab is a normal page
         # A prepended <base target=_blank> makes every link open in a new tab,
         # even ones the email didn't tag (modern browsers imply rel=noopener).
-        srcdoc = html.escape('<base target="_blank">' + content, quote=True)
+        # The injected <meta viewport> + reset caps images and tables to the
+        # box width so fixed-width (e.g. 600px) emails fit on a phone instead
+        # of overflowing. width!important overrides inline widths on wide
+        # layout tables; images scale down and keep their aspect ratio.
+        head = (
+            # Doctype first forces standards mode so width:100% resolves against
+            # the iframe viewport (in quirks mode a wide table won't shrink).
+            "<!doctype html>"
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<base target="_blank">'
+            '<style>'
+            'html{-webkit-text-size-adjust:100%}'
+            'body{margin:0}'
+            # Cap images and fixed-width layout tables to the box so a desktop
+            # (e.g. 600px) email fits on a phone. A broken image is the one case
+            # that can still overflow (it falls back to its width attribute and
+            # ignores max-width) -- allow that to scroll rather than clipping the
+            # surrounding text.
+            'img{max-width:100%!important;height:auto}'
+            'table{max-width:100%!important}'
+            '</style>'
+        )
+        srcdoc = html.escape(head + content, quote=True)
         rendered = (
             "<iframe sandbox='allow-popups allow-popups-to-escape-sandbox' "
             "style='width:100%;height:70vh;border:1px solid #ccc' "
