@@ -17,7 +17,7 @@ For local dev or when fronted by another auth proxy, set AUTH_DISABLED=true.
 import os
 import html
 import secrets
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -540,11 +540,14 @@ def delete_message(message_id: str):
 @app.post("/messages/delete", dependencies=[Depends(require_login)])
 async def delete_messages(request: Request):
     """Bulk delete: the selected messageIds, or every message when 'all' is set."""
-    form = await request.form()
-    if form.get("all"):
+    # Parse the urlencoded form body directly so we don't need python-multipart
+    # (nothing else in this app parses form bodies). parse_qs returns each
+    # field as a list, so 'ids' naturally collects every checked box.
+    fields = parse_qs((await request.body()).decode("utf-8"))
+    if fields.get("all"):
         _purge_messages(None)  # delete everything
     else:
-        ids = set(form.getlist("ids"))
+        ids = set(fields.get("ids", []))
         if ids:
             _purge_messages(ids)
     return RedirectResponse("/", status_code=303)
