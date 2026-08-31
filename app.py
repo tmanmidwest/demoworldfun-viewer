@@ -154,8 +154,15 @@ def _row(m: dict) -> str:
            else "<span title=unread style='color:#0645ad'>●</span>")
     subj = html.escape(m.get("subject", "(no subject)"))
     subj_weight = "" if is_read else "font-weight:600"
+    # Checkbox carries this row's messageId for bulk delete. The value is
+    # attribute-quoted, so escape with quote=True.
+    checkbox = (
+        f"<input type=checkbox class=rowcheck name=ids "
+        f"value=\"{html.escape(m['messageId'], quote=True)}\">"
+    )
     return (
         f"<tr class='{'read' if is_read else 'unread'}'>"
+        f"<td style='text-align:center'>{checkbox}</td>"
         f"<td style='text-align:center'>{dot}</td>"
         f"<td>{html.escape(m.get('recipient', ''))}</td>"
         f"<td>{html.escape(m.get('sender', ''))}</td>"
@@ -184,7 +191,6 @@ def _nav() -> str:
 
 PAGE = """<!doctype html><meta charset=utf-8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="10">
 <title>{title} inbox</title>
 <style>
  body{{font:14px system-ui,sans-serif;margin:2rem;max-width:1000px}}
@@ -195,6 +201,11 @@ PAGE = """<!doctype html><meta charset=utf-8>
  .muted{{color:#888}}
  tr.read td{{color:#999}}
  tr.read a{{color:#7a93c0}}
+ .toolbar{{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 1rem}}
+ .toolbar button{{font-size:13px;padding:.35rem .7rem;border:1px solid #ccc;
+   border-radius:4px;background:#fff;cursor:pointer}}
+ .toolbar button.danger{{color:#b00;border-color:#e0b4b4}}
+ .toolbar button:disabled{{color:#bbb;border-color:#eee;cursor:default}}
  /* Phone: reflow each table row into a stacked card (sender + subject
     prominent; recipient/date/delete secondary). Desktop table unchanged. */
  @media (max-width:600px){{
@@ -204,20 +215,57 @@ PAGE = """<!doctype html><meta charset=utf-8>
   tr{{display:flex;flex-wrap:wrap;align-items:baseline;gap:.15rem .5rem;
       border:1px solid #ddd;border-radius:8px;padding:.6rem .7rem;margin-bottom:.6rem}}
   td{{border:0;padding:0}}
-  td:nth-child(1){{order:1}}                                   /* read dot */
-  td:nth-child(3){{order:2;flex:1;font-weight:600}}            /* From */
-  td:nth-child(5){{order:3;color:#888;font-size:12px}}         /* Received */
-  td:nth-child(4){{order:4;width:100%}}                        /* Subject */
-  td:nth-child(2){{order:5;color:#888;font-size:12px}}         /* To */
-  td:nth-child(2)::before{{content:'to: '}}
-  td:nth-child(6){{order:6;margin-left:auto}}                  /* Delete */
+  td:nth-child(1){{order:0}}                                   /* checkbox */
+  td:nth-child(2){{order:1}}                                   /* read dot */
+  td:nth-child(4){{order:2;flex:1;font-weight:600}}            /* From */
+  td:nth-child(6){{order:3;color:#888;font-size:12px}}         /* Received */
+  td:nth-child(5){{order:4;width:100%}}                        /* Subject */
+  td:nth-child(3){{order:5;color:#888;font-size:12px}}         /* To */
+  td:nth-child(3)::before{{content:'to: '}}
+  td:nth-child(7){{order:6;margin-left:auto}}                  /* Delete */
  }}
 </style>
 {nav}
 <h2>{title} &mdash; inbox{title_extra}</h2>
-<p class=muted>Auto-refreshes every 10s.</p>
-<table><thead><tr><th></th><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th></tr></thead>
-<tbody>{rows}</tbody></table>"""
+<p class=muted>Auto-refreshes every 10s (paused while you have messages selected).</p>
+<form method=post action='/messages/delete' id=bulk>
+ <div class=toolbar>
+  <button type=submit id=delsel class=danger disabled
+    onclick="return confirm('Delete the selected messages permanently?')">Delete selected</button>
+  <button type=submit name=all value=1 class=danger
+    onclick="return confirm('Delete ALL messages permanently?')">Delete all</button>
+  <span class=muted id=selcount></span>
+ </div>
+ <table><thead><tr>
+  <th><input type=checkbox id=checkall title='Select all'></th>
+  <th></th><th>To</th><th>From</th><th>Subject</th><th>Received (UTC)</th><th></th>
+ </tr></thead>
+ <tbody>{rows}</tbody></table>
+</form>
+<script>
+ // Auto-refresh, but only while nothing is selected -- so a reload never wipes
+ // an in-progress selection. A plain <meta refresh> couldn't be paused.
+ var timer = setTimeout(function(){{ location.reload(); }}, 10000);
+ var checks = function(){{ return [].slice.call(document.querySelectorAll('.rowcheck')); }};
+ var checkall = document.getElementById('checkall');
+ var delsel = document.getElementById('delsel');
+ var count = document.getElementById('selcount');
+ function sync(){{
+   var n = checks().filter(function(c){{ return c.checked; }}).length;
+   delsel.disabled = n === 0;
+   count.textContent = n ? n + ' selected' : '';
+   if (checkall) checkall.checked = n > 0 && n === checks().length;
+   if (n > 0 && timer) {{ clearTimeout(timer); timer = null; }}  // pause refresh
+ }}
+ if (checkall) checkall.addEventListener('change', function(){{
+   checks().forEach(function(c){{ c.checked = checkall.checked; }});
+   sync();
+ }});
+ document.addEventListener('change', function(e){{
+   if (e.target.classList.contains('rowcheck')) sync();
+ }});
+ sync();
+</script>"""
 
 
 LOGIN_PAGE = """<!doctype html><meta charset=utf-8>
@@ -335,7 +383,7 @@ def inbox_all():
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=6 class=muted>No mail yet.</td></tr>",
+        rows=rows or "<tr><td colspan=7 class=muted>No mail yet.</td></tr>",
         title_extra="",
     )
 
@@ -351,7 +399,7 @@ def inbox_for(address: str):
     return PAGE.format(
         title=html.escape(APP_TITLE),
         nav=_nav(),
-        rows=rows or "<tr><td colspan=6 class=muted>No mail.</td></tr>",
+        rows=rows or "<tr><td colspan=7 class=muted>No mail.</td></tr>",
         title_extra=f" &mdash; {html.escape(address)}",
     )
 
@@ -434,42 +482,69 @@ def view_message(message_id: str, r: str = "", t: str = ""):
         "<body style='font:14px system-ui,sans-serif;margin:2rem;overflow-wrap:anywhere'>"
         "<style>@media(max-width:600px){body{margin:1rem}}</style>"
         "<a href='/'>&larr; inbox</a>"
-        f"<span style='float:right'>{_delete_button(html.escape(message_id))}</span>"
+        + ("<a href='/logout' style='margin-left:1rem;font-size:13px'>Log out</a>"
+           if AUTH_ENABLED else "")
+        + f"<span style='float:right'>{_delete_button(html.escape(message_id))}</span>"
         "<hr>"
         f"{meta}{rendered}"
     )
 
 
-@app.post("/message/{message_id}/delete", dependencies=[Depends(require_login)])
-def delete_message(message_id: str):
-    """Permanently remove a message: the raw email in S3 and all index rows."""
-    # 1. Delete the raw email object from S3
-    try:
-        s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{message_id}")
-    except Exception:
-        pass  # already gone / expired — fall through to index cleanup
+def _purge_messages(message_ids=None):
+    """Permanently remove messages: raw emails in S3 and all index rows.
 
-    # 2. Delete every DynamoDB index row referencing this messageId.
-    #    A message may have one row per recipient. Walk the global feed
-    #    (small at demo volume) and delete matches.
+    Walks the global feed ONCE (small at demo volume). If message_ids is None,
+    everything is deleted; otherwise only rows whose messageId is in the set.
+    Doing it in a single pass keeps "delete all" and multi-select linear rather
+    than re-scanning the feed per message. S3 objects are deleted once per
+    distinct messageId (a message can have one index row per recipient).
+    """
+    deleted_from_s3 = set()
     start_key = None
-    while True:
-        kwargs = dict(
-            IndexName="global-index",
-            KeyConditionExpression=Key("inbox").eq("ALL"),
-        )
-        if start_key:
-            kwargs["ExclusiveStartKey"] = start_key
-        resp = table.query(**kwargs)
-        for it in resp.get("Items", []):
-            if it.get("messageId") == message_id:
-                table.delete_item(Key={
+    with table.batch_writer() as batch:
+        while True:
+            kwargs = dict(
+                IndexName="global-index",
+                KeyConditionExpression=Key("inbox").eq("ALL"),
+            )
+            if start_key:
+                kwargs["ExclusiveStartKey"] = start_key
+            resp = table.query(**kwargs)
+            for it in resp.get("Items", []):
+                mid = it.get("messageId")
+                if message_ids is not None and mid not in message_ids:
+                    continue
+                batch.delete_item(Key={
                     "recipient": it["recipient"],
                     "receivedAt": it["receivedAt"],
                 })
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            break
+                if mid and mid not in deleted_from_s3:
+                    deleted_from_s3.add(mid)
+                    try:
+                        s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{mid}")
+                    except Exception:
+                        pass  # already gone / expired — index cleanup still runs
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
 
+
+@app.post("/message/{message_id}/delete", dependencies=[Depends(require_login)])
+def delete_message(message_id: str):
+    """Permanently remove a single message: the raw email in S3 and index rows."""
+    _purge_messages({message_id})
     # 303 -> browser re-requests the inbox with GET
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/messages/delete", dependencies=[Depends(require_login)])
+async def delete_messages(request: Request):
+    """Bulk delete: the selected messageIds, or every message when 'all' is set."""
+    form = await request.form()
+    if form.get("all"):
+        _purge_messages(None)  # delete everything
+    else:
+        ids = set(form.getlist("ids"))
+        if ids:
+            _purge_messages(ids)
     return RedirectResponse("/", status_code=303)
