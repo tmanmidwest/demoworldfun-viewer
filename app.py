@@ -501,32 +501,34 @@ def _purge_messages(message_ids=None):
     """
     deleted_from_s3 = set()
     start_key = None
-    with table.batch_writer() as batch:
-        while True:
-            kwargs = dict(
-                IndexName="global-index",
-                KeyConditionExpression=Key("inbox").eq("ALL"),
-            )
-            if start_key:
-                kwargs["ExclusiveStartKey"] = start_key
-            resp = table.query(**kwargs)
-            for it in resp.get("Items", []):
-                mid = it.get("messageId")
-                if message_ids is not None and mid not in message_ids:
-                    continue
-                batch.delete_item(Key={
-                    "recipient": it["recipient"],
-                    "receivedAt": it["receivedAt"],
-                })
-                if mid and mid not in deleted_from_s3:
-                    deleted_from_s3.add(mid)
-                    try:
-                        s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{mid}")
-                    except Exception:
-                        pass  # already gone / expired — index cleanup still runs
-            start_key = resp.get("LastEvaluatedKey")
-            if not start_key:
-                break
+    while True:
+        kwargs = dict(
+            IndexName="global-index",
+            KeyConditionExpression=Key("inbox").eq("ALL"),
+        )
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        resp = table.query(**kwargs)
+        for it in resp.get("Items", []):
+            mid = it.get("messageId")
+            if message_ids is not None and mid not in message_ids:
+                continue
+            # One DeleteItem per row -- uses the same dynamodb:DeleteItem
+            # permission the single-message delete already relies on, so no
+            # extra IAM (BatchWriteItem) is needed to run this.
+            table.delete_item(Key={
+                "recipient": it["recipient"],
+                "receivedAt": it["receivedAt"],
+            })
+            if mid and mid not in deleted_from_s3:
+                deleted_from_s3.add(mid)
+                try:
+                    s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{mid}")
+                except Exception:
+                    pass  # already gone / expired — index cleanup still runs
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
 
 
 @app.post("/message/{message_id}/delete", dependencies=[Depends(require_login)])
