@@ -2,21 +2,30 @@
 demoworldfun inbox viewer.
 
 A small, portable FastAPI app that lists inbound emails indexed in DynamoDB
-and renders message bodies from S3. Designed to be cloned and run by anyone:
-all operational settings are environment variables, and AWS credentials are
-supplied at deploy time (env vars locally, or an instance/task role on AWS) --
-never entered through the UI.
+and renders message bodies from S3.
 
-Auth: single sign-on via an OpenID Connect provider (e.g. Authentik). Configure
-it with OIDC_DISCOVERY_URL + OIDC_CLIENT_ID + OIDC_CLIENT_SECRET + SESSION_SECRET
-and users log in through the provider's Authorization Code flow. Optionally
-restrict access to members of one or more provider groups via OIDC_ALLOWED_GROUPS.
-For local dev or when fronted by another auth proxy, set AUTH_DISABLED=true.
+Configuration is done through the UI at /settings and persisted to CONFIG_FILE:
+the AWS wiring (region, table, index, bucket, prefix), AWS credentials, the app
+title, and OIDC/Authentik single sign-on. Every setting is also seeded from a
+matching environment variable on first boot, so an existing env-var deployment
+keeps working. Only four "bootstrap" settings stay environment-only, because
+each would be circular to set through the page it enables: ADMIN_TOKEN (unlocks
+/settings), SESSION_SECRET (signs the session), SECURE_COOKIES (cookie transport
+flag), and CONFIG_FILE (where settings are stored).
+
+Auth: single sign-on via an OpenID Connect provider (e.g. Authentik), using the
+Authorization Code flow, optionally restricted to members of given provider
+groups. Access fails closed -- if SSO is enabled but not fully configured, the
+inbox is blocked rather than served without a login. Set it up at /settings, or
+turn SSO off there to run open (local dev, or behind another auth proxy).
 """
 
 import os
+import json
 import html
+import logging
 import secrets
+import tempfile
 from urllib.parse import urlencode, parse_qs
 
 import boto3
@@ -28,70 +37,248 @@ from fastapi import FastAPI, Depends, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
+log = logging.getLogger("viewer")
+
 # ---------------------------------------------------------------------------
-# Configuration (all via environment)
+# Configuration
 # ---------------------------------------------------------------------------
-# Operational settings -- safe to set anywhere, not secret:
-TABLE_NAME = os.environ["TABLE_NAME"]
-BUCKET_NAME = os.environ["BUCKET_NAME"]
-S3_PREFIX = os.environ.get("S3_PREFIX", "inbox/")
-APP_TITLE = os.environ.get("APP_TITLE", "inbox")  # shown in the UI header
-
-# Auth via OpenID Connect (Authentik). Disabled only with an explicit opt-out,
-# so the app fails closed if you forget to configure it.
-AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")
-AUTH_ENABLED = not AUTH_DISABLED
-
-OIDC_DISCOVERY_URL = os.environ.get("OIDC_DISCOVERY_URL")
-OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID")
-OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET")
-# Exact callback URL registered in Authentik. If unset, it is derived per
-# request -- but behind an ALB/proxy you should set it explicitly so the scheme
-# and host always match what the provider expects.
-OIDC_REDIRECT_URI = os.environ.get("OIDC_REDIRECT_URI")
-# Optional comma-separated allow-list of provider groups. Empty = any
-# authenticated user the provider lets through.
-OIDC_ALLOWED_GROUPS = [
-    g.strip() for g in os.environ.get("OIDC_ALLOWED_GROUPS", "").split(",") if g.strip()
-]
-
+# Almost everything is configured through the UI at /settings and persisted to
+# CONFIG_FILE. Only four "bootstrap" settings stay in the environment, because
+# each one would be circular to configure through the very page it enables:
+#   - ADMIN_TOKEN   unlocks /settings; it can't be set through the page it guards.
+#   - SESSION_SECRET signs the session cookie (incl. the admin unlock); changing
+#                    it would invalidate the session you're using, and it's
+#                    needed before /settings is even reachable.
+#   - CONFIG_FILE   is *where* UI settings are stored, so it can't be one of them.
+#   - SECURE_COOKIES sets the cookie Secure flag at middleware init (a transport
+#                    fact -- are you behind HTTPS?); it isn't changeable per-save.
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 SECURE_COOKIES = os.environ.get("SECURE_COOKIES", "").lower() in ("1", "true", "yes")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+# Where UI-entered settings are persisted. The container is otherwise stateless,
+# so on-prem this should point at a mounted volume that survives recreation
+# (the Dockerfile defaults it to /data/config.json).
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "/data/config.json")
+
+
+def _bool_env(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes")
+
+
+def _groups_list(value) -> list:
+    """Normalise allowed-groups from a list (file) or comma string (env/form)."""
+    if isinstance(value, list):
+        items = value
+    else:
+        items = str(value or "").split(",")
+    return [g.strip() for g in items if str(g).strip()]
+
+
+# The mutable application configuration. Seeded from the environment (so an
+# existing env-var deployment keeps working), then overlaid by whatever has been
+# saved through the UI. This is the single source of truth the request handlers
+# read at call time -- so a save takes effect without a restart.
+CONFIG = {
+    # Display
+    "app_title": os.environ.get("APP_TITLE", "inbox"),
+    # AWS wiring (the backend the viewer reads from)
+    "aws_region": os.environ.get("AWS_REGION")
+                  or os.environ.get("AWS_DEFAULT_REGION", ""),
+    "table_name": os.environ.get("TABLE_NAME", ""),
+    "dynamodb_index": os.environ.get("DYNAMODB_INDEX", "global-index"),
+    "bucket_name": os.environ.get("BUCKET_NAME", ""),
+    "s3_prefix": os.environ.get("S3_PREFIX", "inbox/"),
+    # AWS credentials. Blank = fall back to the standard boto3 chain (ambient
+    # env vars, a mounted ~/.aws, or an instance/task role).
+    "aws_access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+    "aws_secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+    "aws_session_token": os.environ.get("AWS_SESSION_TOKEN", ""),
+    # Auth (OIDC / Authentik)
+    "auth_disabled": _bool_env("AUTH_DISABLED"),
+    "oidc_discovery_url": os.environ.get("OIDC_DISCOVERY_URL", ""),
+    "oidc_client_id": os.environ.get("OIDC_CLIENT_ID", ""),
+    "oidc_client_secret": os.environ.get("OIDC_CLIENT_SECRET", ""),
+    "oidc_redirect_uri": os.environ.get("OIDC_REDIRECT_URI", ""),
+    "oidc_allowed_groups": _groups_list(os.environ.get("OIDC_ALLOWED_GROUPS", "")),
+}
+
+# Fields the UI is allowed to persist. The env-only bootstrap quartet
+# (ADMIN_TOKEN / SESSION_SECRET / SECURE_COOKIES / CONFIG_FILE) is intentionally
+# NOT here.
+_PERSISTED_KEYS = tuple(CONFIG.keys())
+
+# Secret fields: masked in the UI, and a blank form field means "keep existing".
+_SECRET_KEYS = ("oidc_client_secret", "aws_secret_access_key", "aws_session_token")
+
+
+def app_title() -> str:
+    return CONFIG["app_title"] or "inbox"
 
 oauth = OAuth()
 
-if AUTH_ENABLED:
-    missing = [
-        name for name, val in (
-            ("OIDC_DISCOVERY_URL", OIDC_DISCOVERY_URL),
-            ("OIDC_CLIENT_ID", OIDC_CLIENT_ID),
-            ("OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET),
-            ("SESSION_SECRET", SESSION_SECRET),
-        ) if not val
-    ]
-    if missing:
-        raise RuntimeError(
-            "OIDC auth is enabled but these are missing: "
-            + ", ".join(missing)
-            + ".\nSet them, or set AUTH_DISABLED=true to run without login.\n"
-            "Generate SESSION_SECRET with:\n"
-            "  python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+
+def _load_persisted_config() -> None:
+    """Overlay any saved config file onto CONFIG (env values are the fallback)."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        log.warning("Ignoring unreadable config file %s: %s", CONFIG_FILE, exc)
+        return
+    for key in _PERSISTED_KEYS:
+        if key in saved:
+            CONFIG[key] = (
+                _groups_list(saved[key]) if key == "oidc_allowed_groups"
+                else saved[key]
+            )
+
+
+def _save_persisted_config() -> None:
+    """Atomically write the persisted subset of CONFIG to CONFIG_FILE (0600)."""
+    data = {k: CONFIG[k] for k in _PERSISTED_KEYS}
+    directory = os.path.dirname(CONFIG_FILE) or "."
+    os.makedirs(directory, exist_ok=True)
+    # Write to a temp file in the same dir, then rename -- never leaves a
+    # half-written config that a concurrent reader could pick up.
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".config-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.chmod(tmp, 0o600)  # the file holds secrets (OIDC + AWS credentials)
+        os.replace(tmp, CONFIG_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def auth_enabled() -> bool:
+    """Intent to require login. Independent of whether OIDC is fully wired --
+    so an incomplete config blocks access (fails closed) rather than opening it."""
+    return not CONFIG["auth_disabled"]
+
+
+def oidc_ready() -> bool:
+    """True when the OIDC client is registered and login can actually proceed."""
+    return "oidc" in getattr(oauth, "_registry", {})
+
+
+def configure_oauth() -> None:
+    """(Re)build the OAuth client from CONFIG. Safe to call after every save."""
+    global oauth
+    oauth = OAuth()  # fresh registry; avoids 're-registering' errors
+    if auth_enabled() and all((
+        CONFIG["oidc_discovery_url"],
+        CONFIG["oidc_client_id"],
+        CONFIG["oidc_client_secret"],
+    )):
+        oauth.register(
+            name="oidc",
+            server_metadata_url=CONFIG["oidc_discovery_url"],
+            client_id=CONFIG["oidc_client_id"],
+            client_secret=CONFIG["oidc_client_secret"],
+            client_kwargs={"scope": "openid email profile"},
         )
-    oauth.register(
-        name="oidc",
-        server_metadata_url=OIDC_DISCOVERY_URL,
-        client_id=OIDC_CLIENT_ID,
-        client_secret=OIDC_CLIENT_SECRET,
-        client_kwargs={"scope": "openid email profile"},
-    )
+    elif auth_enabled():
+        log.warning(
+            "SSO login is enabled but OIDC is not fully configured -- access is "
+            "blocked until it is set at /settings (or SSO is turned off there)."
+        )
 
-# AWS credentials come from the standard boto3 chain -- env vars locally, or an
-# instance/task role on AWS. They are never read from or written to the UI.
-ddb = boto3.resource("dynamodb")
-table = ddb.Table(TABLE_NAME)
-s3 = boto3.client("s3")
 
-app = FastAPI(title=f"{APP_TITLE} inbox")
+# AWS clients, (re)built from CONFIG. ``table`` is the DynamoDB Table used by the
+# request handlers; ``s3`` the S3 client. Both are None until AWS is configured.
+ddb = None
+table = None
+s3 = None
+AWS_ERROR = ""  # last failure building the clients, surfaced in /settings
+
+
+def build_aws_clients() -> None:
+    """(Re)build the boto3 clients from CONFIG. Safe to call after every save.
+
+    Credentials in CONFIG are used when present; otherwise boto3 falls back to
+    its standard chain (ambient env vars, a mounted ~/.aws, or an instance/task
+    role) -- so this stays compatible with credential-less deployments.
+    """
+    global ddb, table, s3, AWS_ERROR
+    kwargs = {}
+    if CONFIG["aws_region"]:
+        kwargs["region_name"] = CONFIG["aws_region"]
+    if CONFIG["aws_access_key_id"] and CONFIG["aws_secret_access_key"]:
+        kwargs["aws_access_key_id"] = CONFIG["aws_access_key_id"]
+        kwargs["aws_secret_access_key"] = CONFIG["aws_secret_access_key"]
+        if CONFIG["aws_session_token"]:
+            kwargs["aws_session_token"] = CONFIG["aws_session_token"]
+    try:
+        session = boto3.session.Session(**kwargs)
+        s3 = session.client("s3")
+        ddb = session.resource("dynamodb")
+        table = ddb.Table(CONFIG["table_name"]) if CONFIG["table_name"] else None
+        AWS_ERROR = ""
+    except Exception as exc:  # e.g. NoRegionError before a region is set
+        ddb = table = s3 = None
+        AWS_ERROR = str(exc)
+        log.warning("Could not build AWS clients yet: %s", exc)
+
+
+def aws_ready() -> bool:
+    """True when the clients exist and a table + bucket are configured."""
+    return bool(table is not None and s3 is not None and CONFIG["bucket_name"])
+
+
+def _test_aws():
+    """Exercise the exact operations the app needs, using the current config.
+
+    Returns (ok, [(check, ok, detail), ...]). Deliberately mirrors the app's
+    real access pattern -- a Query on the feed index, then a HeadObject (same
+    permission as GetObject) on a real key -- so it validates the *permissions*
+    the viewer actually uses, not broader ones like ListBucket/DescribeTable.
+    """
+    if not aws_ready():
+        detail = AWS_ERROR or "set region, table and bucket first"
+        return False, [("AWS clients", False, detail)]
+    checks = []
+    ok_all = True
+    sample_id = None
+    try:
+        resp = table.query(
+            IndexName=CONFIG["dynamodb_index"],
+            KeyConditionExpression=Key("inbox").eq("ALL"),
+            ScanIndexForward=False,
+            Limit=1,
+        )
+        items = resp.get("Items", [])
+        sample_id = items[0].get("messageId") if items else None
+        checks.append(("DynamoDB Query (feed index)", True,
+                       f"{len(items)} row(s) returned"))
+    except Exception as exc:
+        ok_all = False
+        checks.append(("DynamoDB Query (feed index)", False, str(exc)))
+    if sample_id:
+        try:
+            s3.head_object(Bucket=CONFIG["bucket_name"],
+                           Key=f"{CONFIG['s3_prefix']}{sample_id}")
+            checks.append(("S3 GetObject (message body)", True, "object reachable"))
+        except Exception as exc:
+            ok_all = False
+            checks.append(("S3 GetObject (message body)", False, str(exc)))
+    else:
+        checks.append(("S3 GetObject (message body)", True,
+                       "skipped — no messages to test against"))
+    return ok_all, checks
+
+
+_load_persisted_config()
+configure_oauth()
+build_aws_clients()
+
+app = FastAPI(title="inbox")
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET or secrets.token_urlsafe(32),
@@ -114,23 +301,30 @@ async def _to_login(request: Request, exc: NotAuthenticated):
 
 def require_login(request: Request):
     """Dependency: allow through if auth is disabled or the session is logged in."""
-    if not AUTH_ENABLED:
+    if not auth_enabled():
         return
     if not request.session.get("user"):
         raise NotAuthenticated()
 
 
 def _callback_uri(request: Request) -> str:
-    """The OIDC redirect URI: explicit env value, else derived from the request."""
-    return OIDC_REDIRECT_URI or str(request.url_for("auth_callback"))
+    """The OIDC redirect URI: explicit configured value, else derived from the
+    request. Behind a proxy set it explicitly so scheme/host match the provider."""
+    return CONFIG["oidc_redirect_uri"] or str(request.url_for("auth_callback"))
 
 
 def _group_allowed(userinfo: dict) -> bool:
     """True if no group restriction is set, or the user is in an allowed group."""
-    if not OIDC_ALLOWED_GROUPS:
+    allowed = CONFIG["oidc_allowed_groups"]
+    if not allowed:
         return True
     user_groups = userinfo.get("groups") or []
-    return any(g in OIDC_ALLOWED_GROUPS for g in user_groups)
+    return any(g in allowed for g in user_groups)
+
+
+def admin_ok(request: Request) -> bool:
+    """Whether this session has unlocked the settings page with ADMIN_TOKEN."""
+    return bool(request.session.get("is_admin"))
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +378,12 @@ def _delete_button(message_id: str) -> str:
 
 
 def _nav() -> str:
-    if AUTH_ENABLED:
-        return "<a href='/logout' style='float:right;font-size:13px'>Log out</a>"
-    return ""
+    links = ["<a href='/settings' style='font-size:13px'>Settings</a>"]
+    if auth_enabled():
+        links.append("<a href='/logout' style='font-size:13px'>Log out</a>")
+    return (
+        "<div style='float:right;display:flex;gap:1rem'>" + "".join(links) + "</div>"
+    )
 
 
 PAGE = """<!doctype html><meta charset=utf-8>
@@ -308,6 +505,180 @@ LOGGED_OUT_PAGE = """<!doctype html><meta charset=utf-8>
 </div>"""
 
 
+# Shown when ADMIN_TOKEN is not set: the settings page is fail-closed.
+SETTINGS_DISABLED_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; settings unavailable</title>
+<style>
+ body{{font:14px system-ui,sans-serif;margin:2rem;max-width:640px}}
+ code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}}
+ .card{{border:1px solid #e0b4b4;border-radius:8px;padding:1.2rem 1.4rem;background:#fdf7f7}}
+</style>
+<p><a href='/'>&larr; inbox</a></p>
+<h2>Settings are locked</h2>
+<div class=card>
+ <p>The settings page is disabled because no <code>ADMIN_TOKEN</code> is set.</p>
+ <p>Set an <code>ADMIN_TOKEN</code> in the container's environment (for example in
+    your <code>.env</code> / compose file) and restart. That token is what unlocks
+    this page, so OIDC &mdash; which is itself the login &mdash; can be configured
+    here safely.</p>
+</div>"""
+
+
+UNLOCK_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; unlock settings</title>
+<style>
+ body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
+       align-items:center;min-height:90vh;margin:0}}
+ .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:300px}}
+ h2{{margin:0 0 1rem;text-align:center}}
+ label{{display:block;font-size:13px;color:#444;margin:0 0 .3rem}}
+ input{{width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #ccc;
+        border-radius:4px;font-size:14px}}
+ button{{margin-top:1rem;width:100%;padding:.6rem;border:0;border-radius:4px;
+         background:#0645ad;color:#fff;font-size:14px;cursor:pointer}}
+ .err{{color:#b00;font-size:13px;min-height:1.2em;margin:.4rem 0}}
+</style>
+<form class=card method=post action='/settings/unlock'>
+ <h2>Unlock settings</h2>
+ <div class=err>{error}</div>
+ <label for=token>Admin token</label>
+ <input id=token name=token type=password autofocus autocomplete=off>
+ <button type=submit>Unlock</button>
+</form>"""
+
+
+SETTINGS_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; settings</title>
+<style>
+ body{{font:14px system-ui,sans-serif;margin:2rem;max-width:680px}}
+ a{{color:#0645ad;text-decoration:none}}
+ fieldset{{border:1px solid #ddd;border-radius:8px;padding:1rem 1.2rem;margin:1.2rem 0}}
+ legend{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666;padding:0 .4rem}}
+ label{{display:block;font-size:13px;color:#333;margin:.9rem 0 .3rem;font-weight:600}}
+ .hint{{font-weight:400;color:#888;font-size:12px}}
+ input[type=text],input[type=url],input[type=password]{{width:100%;box-sizing:border-box;
+   padding:.5rem;border:1px solid #ccc;border-radius:4px;font-size:14px}}
+ .row{{display:flex;align-items:center;gap:.5rem;margin:.4rem 0}}
+ .row label{{margin:0;font-weight:600}}
+ button{{padding:.55rem 1.1rem;border:0;border-radius:4px;background:#0645ad;
+         color:#fff;font-size:14px;cursor:pointer}}
+ .ok{{color:#0a7a34;font-size:13px;min-height:1.2em}}
+ .warn{{background:#fffbe6;border:1px solid #ecd9a0;border-radius:6px;
+        padding:.6rem .8rem;font-size:13px;color:#7a5c00;margin:.6rem 0}}
+ code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}}
+ .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:0 1rem}}
+ @media (max-width:560px){{.grid2{{grid-template-columns:1fr}}}}
+ .test{{border:1px solid #ddd;border-radius:8px;padding:.6rem .9rem;margin:.6rem 0;
+        font-size:13px}}
+ .test .pass{{color:#0a7a34}} .test .fail{{color:#b00}}
+ .test li{{margin:.25rem 0;list-style:none}}
+ .test ul{{padding-left:0;margin:.3rem 0}}
+ .buttons{{display:flex;gap:.6rem;flex-wrap:wrap}}
+ .buttons button.secondary{{background:#fff;color:#0645ad;border:1px solid #0645ad}}
+</style>
+<p><a href='/'>&larr; inbox</a> &nbsp;·&nbsp; <a href='/settings/lock'>Lock settings</a></p>
+<h2>{title} &mdash; settings</h2>
+<div class=ok>{status}</div>
+{state_banner}
+{aws_test}
+<form method=post action='/settings'>
+ <fieldset>
+  <legend>General</legend>
+  <label for=apptitle>App title
+   <span class=hint>shown in the header and browser tab</span></label>
+  <input id=apptitle name=app_title type=text value="{app_title}">
+ </fieldset>
+ <fieldset>
+  <legend>AWS backend (DynamoDB + S3)</legend>
+  <div class=grid2>
+   <div>
+    <label for=region>Region</label>
+    <input id=region name=aws_region type=text value="{aws_region}" placeholder="us-east-1">
+   </div>
+   <div>
+    <label for=index>DynamoDB index
+     <span class=hint>the feed GSI</span></label>
+    <input id=index name=dynamodb_index type=text value="{dynamodb_index}" placeholder="global-index">
+   </div>
+   <div>
+    <label for=table>DynamoDB table</label>
+    <input id=table name=table_name type=text value="{table_name}" placeholder="demoworldfun-messages">
+   </div>
+   <div>
+    <label for=bucket>S3 bucket</label>
+    <input id=bucket name=bucket_name type=text value="{bucket_name}" placeholder="demoworldfun-inbound-mail">
+   </div>
+   <div>
+    <label for=prefix>S3 prefix</label>
+    <input id=prefix name=s3_prefix type=text value="{s3_prefix}" placeholder="inbox/">
+   </div>
+  </div>
+
+  <label for=akid>Access key ID
+   <span class=hint>leave all three credential fields blank to use an instance/task
+     role or a mounted ~/.aws instead</span></label>
+  <input id=akid name=aws_access_key_id type=text value="{aws_access_key_id}" autocomplete=off>
+
+  <label for=asak>Secret access key
+   <span class=hint>{aws_secret_hint}</span></label>
+  <input id=asak name=aws_secret_access_key type=password value=""
+    autocomplete=off placeholder="{aws_secret_placeholder}">
+
+  <label for=astok>Session token
+   <span class=hint>only for temporary/SSO credentials; {aws_token_hint}</span></label>
+  <input id=astok name=aws_session_token type=password value=""
+    autocomplete=off placeholder="{aws_token_placeholder}">
+
+  <p class=hint>The IAM identity needs, at minimum:
+     <code>dynamodb:Query</code>, <code>UpdateItem</code>, <code>DeleteItem</code>
+     on the table + its index, and <code>s3:GetObject</code>,
+     <code>DeleteObject</code> on the bucket. Use &ldquo;Save &amp; test&rdquo;
+     below to verify.</p>
+ </fieldset>
+ <fieldset>
+  <legend>Single sign-on (OpenID Connect / Authentik)</legend>
+  <div class=row>
+   <input id=enable name=auth_enabled type=checkbox value=1 {enabled_checked}>
+   <label for=enable>Require SSO login</label>
+  </div>
+  <p class=hint>When unchecked, the app runs with no login (anyone who can reach
+     it sees the inbox). Leave it on for anything beyond a trusted LAN.</p>
+
+  <label for=disc>Discovery URL
+   <span class=hint>Authentik: Provider &rarr; OpenID Configuration URL</span></label>
+  <input id=disc name=oidc_discovery_url type=url value="{discovery}"
+    placeholder="https://authtime.example.com/application/o/&lt;slug&gt;/.well-known/openid-configuration">
+
+  <label for=cid>Client ID</label>
+  <input id=cid name=oidc_client_id type=text value="{client_id}" autocomplete=off>
+
+  <label for=csec>Client secret
+   <span class=hint>{secret_hint}</span></label>
+  <input id=csec name=oidc_client_secret type=password value=""
+    autocomplete=off placeholder="{secret_placeholder}">
+
+  <label for=redir>Redirect URI
+   <span class=hint>Must EXACTLY match the one registered in Authentik</span></label>
+  <input id=redir name=oidc_redirect_uri type=url value="{redirect_uri}"
+    placeholder="{redirect_suggestion}">
+  <p class=hint>This app's callback path is <code>/auth/callback</code>. Based on
+     how you reached this page, that is likely
+     <code>{redirect_suggestion}</code>.</p>
+
+  <label for=groups>Allowed groups
+   <span class=hint>comma-separated; blank = any authenticated user</span></label>
+  <input id=groups name=oidc_allowed_groups type=text value="{allowed_groups}">
+ </fieldset>
+ <div class=buttons>
+  <button type=submit name=action value=save>Save</button>
+  <button type=submit name=action value=save_test class=secondary>Save &amp; test AWS</button>
+ </div>
+</form>"""
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -320,8 +691,20 @@ def healthz():
 @app.get("/login")
 async def login(request: Request, error: str = ""):
     """Start the OIDC Authorization Code flow (or show an error after a failure)."""
-    if not AUTH_ENABLED or request.session.get("user"):
+    if not auth_enabled() or request.session.get("user"):
         return RedirectResponse("/", status_code=302)
+    if not oidc_ready():
+        # SSO is on but not fully configured -- don't 500 on oauth.oidc; point an
+        # admin at the settings page instead. Access stays blocked meanwhile.
+        return HTMLResponse(
+            LOGIN_PAGE.format(
+                title=html.escape(app_title()),
+                error=html.escape(
+                    "SSO is enabled but not configured yet. An administrator can "
+                    "set it up at /settings."
+                ),
+            )
+        )
     if error:
         messages = {
             "denied": "Your account is not permitted to access this app.",
@@ -329,15 +712,31 @@ async def login(request: Request, error: str = ""):
         }
         msg = messages.get(error, "Sign-in failed. Please try again.")
         return HTMLResponse(
-            LOGIN_PAGE.format(title=html.escape(APP_TITLE), error=html.escape(msg))
+            LOGIN_PAGE.format(title=html.escape(app_title()), error=html.escape(msg))
         )
-    return await oauth.oidc.authorize_redirect(request, _callback_uri(request))
+    try:
+        return await oauth.oidc.authorize_redirect(request, _callback_uri(request))
+    except Exception:
+        # Reaching the provider failed -- almost always a wrong discovery URL or
+        # an unreachable Authentik. Show a helpful message instead of a raw 500;
+        # an admin can fix the discovery URL at /settings.
+        log.exception("Could not start OIDC flow (check the discovery URL)")
+        return HTMLResponse(
+            LOGIN_PAGE.format(
+                title=html.escape(app_title()),
+                error=html.escape(
+                    "Could not reach the SSO provider. An administrator should "
+                    "check the discovery URL at /settings."
+                ),
+            ),
+            status_code=502,
+        )
 
 
 @app.get("/auth/callback", name="auth_callback")
 async def auth_callback(request: Request):
     """OIDC redirect target: exchange the code, enforce group policy, log in."""
-    if not AUTH_ENABLED:
+    if not auth_enabled() or not oidc_ready():
         return RedirectResponse("/", status_code=302)
     try:
         token = await oauth.oidc.authorize_access_token(request)
@@ -368,20 +767,262 @@ def logout(request: Request):
 
 @app.get("/logged-out", response_class=HTMLResponse, name="logged_out")
 def logged_out():
-    return LOGGED_OUT_PAGE.format(title=html.escape(APP_TITLE))
+    return LOGGED_OUT_PAGE.format(title=html.escape(app_title()))
+
+
+# ---------------------------------------------------------------------------
+# Settings (OIDC configured through the UI)
+# ---------------------------------------------------------------------------
+# Access is gated by ADMIN_TOKEN, NOT by SSO -- SSO is the very thing configured
+# here, so it can't protect its own setup page. If ADMIN_TOKEN is unset the page
+# is disabled (fail closed) so an exposed instance can't have its auth hijacked.
+def _admin_guard(request: Request):
+    """Return None if allowed, else a Response to send instead (locked/unlock)."""
+    if not ADMIN_TOKEN:
+        return HTMLResponse(
+            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
+            status_code=403,
+        )
+    if not admin_ok(request):
+        return RedirectResponse("/settings/unlock", status_code=302)
+    return None
+
+
+def _redirect_suggestion(request: Request) -> str:
+    try:
+        return str(request.url_for("auth_callback"))
+    except Exception:
+        return "https://your-app-host/auth/callback"
+
+
+@app.get("/settings/unlock", response_class=HTMLResponse)
+def settings_unlock_form(request: Request, error: str = ""):
+    if not ADMIN_TOKEN:
+        return HTMLResponse(
+            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
+            status_code=403,
+        )
+    if admin_ok(request):
+        return RedirectResponse("/settings", status_code=302)
+    msg = "Incorrect admin token." if error else ""
+    return HTMLResponse(
+        UNLOCK_PAGE.format(title=html.escape(app_title()), error=html.escape(msg))
+    )
+
+
+@app.post("/settings/unlock")
+async def settings_unlock(request: Request):
+    if not ADMIN_TOKEN:
+        return HTMLResponse(
+            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
+            status_code=403,
+        )
+    fields = parse_qs((await request.body()).decode("utf-8"))
+    token = (fields.get("token", [""])[0])
+    # Constant-time compare so a wrong token can't be guessed by timing.
+    if secrets.compare_digest(token, ADMIN_TOKEN):
+        request.session["is_admin"] = True
+        return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/settings/unlock?error=1", status_code=303)
+
+
+@app.get("/settings/lock")
+def settings_lock(request: Request):
+    request.session.pop("is_admin", None)
+    return RedirectResponse("/", status_code=302)
+
+
+def _secret_ui(key: str):
+    """(hint, placeholder) for a masked secret field: blank keeps the saved value."""
+    if CONFIG[key]:
+        return "a value is saved &mdash; leave blank to keep it", "•••••••• (unchanged)"
+    return "not set yet", "paste value"
+
+
+def _test_block_html(checks) -> str:
+    if not checks:
+        return ""
+    items = []
+    for name, ok, detail in checks:
+        mark = "<span class=pass>PASS</span>" if ok else "<span class=fail>FAIL</span>"
+        items.append(
+            f"<li>{mark} &nbsp;{html.escape(name)} "
+            f"<span class=hint>&mdash; {html.escape(detail)}</span></li>"
+        )
+    return ("<div class=test><b>AWS connection test</b><ul>"
+            + "".join(items) + "</ul></div>")
+
+
+def _render_settings(request: Request, status: str = "", checks=None) -> HTMLResponse:
+    banners = []
+    if auth_enabled() and not oidc_ready():
+        banners.append("<div class=warn>SSO is <b>on</b> but not fully configured, "
+                       "so the inbox is currently blocked. Complete the SSO fields "
+                       "and save, or turn off &ldquo;Require SSO login&rdquo;.</div>")
+    elif not auth_enabled():
+        banners.append("<div class=warn>SSO is <b>off</b> &mdash; the inbox is open "
+                       "to anyone who can reach this app.</div>")
+    if not aws_ready():
+        why = f" ({html.escape(AWS_ERROR)})" if AWS_ERROR else ""
+        banners.append("<div class=warn>AWS backend is <b>not configured</b>"
+                       f"{why} &mdash; set the region, table and bucket below.</div>")
+
+    aws_secret_hint, aws_secret_ph = _secret_ui("aws_secret_access_key")
+    oidc_secret_hint, oidc_secret_ph = _secret_ui("oidc_client_secret")
+    token_hint, token_ph = _secret_ui("aws_session_token")
+
+    def esc(key):
+        return html.escape(CONFIG[key], quote=True)
+
+    page = SETTINGS_PAGE.format(
+        title=html.escape(app_title()),
+        status=html.escape(status),
+        state_banner="".join(banners),
+        aws_test=_test_block_html(checks),
+        app_title=esc("app_title"),
+        aws_region=esc("aws_region"),
+        dynamodb_index=esc("dynamodb_index"),
+        table_name=esc("table_name"),
+        bucket_name=esc("bucket_name"),
+        s3_prefix=esc("s3_prefix"),
+        aws_access_key_id=esc("aws_access_key_id"),
+        aws_secret_hint=aws_secret_hint,
+        aws_secret_placeholder=aws_secret_ph,
+        aws_token_hint=token_hint,
+        aws_token_placeholder=token_ph,
+        enabled_checked="checked" if auth_enabled() else "",
+        discovery=esc("oidc_discovery_url"),
+        client_id=esc("oidc_client_id"),
+        secret_hint=oidc_secret_hint,
+        secret_placeholder=oidc_secret_ph,
+        redirect_uri=esc("oidc_redirect_uri"),
+        redirect_suggestion=html.escape(_redirect_suggestion(request), quote=True),
+        allowed_groups=html.escape(", ".join(CONFIG["oidc_allowed_groups"]), quote=True),
+    )
+    return HTMLResponse(page)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_form(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+    return _render_settings(request)
+
+
+@app.post("/settings")
+async def settings_save(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+
+    fields = parse_qs((await request.body()).decode("utf-8"))
+
+    def one(key: str) -> str:
+        return fields.get(key, [""])[0].strip()
+
+    # General + AWS wiring
+    CONFIG["app_title"] = one("app_title") or "inbox"
+    CONFIG["aws_region"] = one("aws_region")
+    CONFIG["table_name"] = one("table_name")
+    CONFIG["dynamodb_index"] = one("dynamodb_index") or "global-index"
+    CONFIG["bucket_name"] = one("bucket_name")
+    CONFIG["s3_prefix"] = one("s3_prefix")
+    CONFIG["aws_access_key_id"] = one("aws_access_key_id")
+
+    # Auth (OIDC)
+    CONFIG["auth_disabled"] = not bool(fields.get("auth_enabled"))
+    CONFIG["oidc_discovery_url"] = one("oidc_discovery_url")
+    CONFIG["oidc_client_id"] = one("oidc_client_id")
+    CONFIG["oidc_redirect_uri"] = one("oidc_redirect_uri")
+    CONFIG["oidc_allowed_groups"] = _groups_list(one("oidc_allowed_groups"))
+
+    # Secret fields: a blank field keeps the saved value (the form masks them),
+    # so submitting the form never silently wipes a stored secret.
+    for key in _SECRET_KEYS:
+        submitted = one(key)
+        if submitted:
+            CONFIG[key] = submitted
+
+    _save_persisted_config()
+    configure_oauth()
+    build_aws_clients()
+
+    notes = ["Saved."]
+    if auth_enabled() and not oidc_ready():
+        notes.append("SSO is still incomplete — see the notice above.")
+
+    checks = None
+    if one("action") == "save_test":
+        _, checks = _test_aws()
+
+    return _render_settings(request, status=" ".join(notes), checks=checks)
+
+
+BACKEND_PROBLEM_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; backend problem</title>
+<style>
+ body{{font:14px system-ui,sans-serif;margin:2rem;max-width:640px}}
+ a{{color:#0645ad}}
+ .card{{border:1px solid #ecd9a0;background:#fffbe6;border-radius:8px;
+        padding:1rem 1.2rem;color:#5c4a00}}
+ code{{background:#00000010;padding:.1rem .3rem;border-radius:3px;word-break:break-word}}
+</style>
+{nav}
+<h2>{title}</h2>
+<div class=card>{body}</div>"""
+
+
+def _backend_page(body: str, status_code: int) -> HTMLResponse:
+    return HTMLResponse(
+        BACKEND_PROBLEM_PAGE.format(
+            title=html.escape(app_title()), nav=_nav(), body=body
+        ),
+        status_code=status_code,
+    )
+
+
+def _backend_unconfigured() -> HTMLResponse:
+    why = f" <p>Last error: <code>{html.escape(AWS_ERROR)}</code></p>" if AWS_ERROR else ""
+    return _backend_page(
+        "<p>The AWS backend isn't configured yet, so there's no inbox to show.</p>"
+        "<p>An administrator can set the region, DynamoDB table, and S3 bucket at "
+        "<a href='/settings'>Settings</a>.</p>" + why,
+        status_code=503,
+    )
+
+
+def _backend_error(exc: Exception) -> HTMLResponse:
+    """A backend call failed at request time -- almost always wrong credentials
+    or a missing IAM permission. Show the error and point at the test button,
+    rather than a raw 500."""
+    log.warning("Backend read failed: %s", exc)
+    return _backend_page(
+        "<p>Couldn't read the AWS backend.</p>"
+        f"<p>The backend returned: <code>{html.escape(str(exc))}</code></p>"
+        "<p>Verify the credentials and IAM permissions at "
+        "<a href='/settings'>Settings</a> with &ldquo;Save &amp; test AWS&rdquo;.</p>",
+        status_code=502,
+    )
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def inbox_all():
-    resp = table.query(
-        IndexName="global-index",
-        KeyConditionExpression=Key("inbox").eq("ALL"),
-        ScanIndexForward=False,
-        Limit=100,
-    )
+    if not aws_ready():
+        return _backend_unconfigured()
+    try:
+        resp = table.query(
+            IndexName=CONFIG["dynamodb_index"],
+            KeyConditionExpression=Key("inbox").eq("ALL"),
+            ScanIndexForward=False,
+            Limit=100,
+        )
+    except Exception as exc:
+        return _backend_error(exc)
     rows = "".join(_row(m) for m in resp.get("Items", []))
     return PAGE.format(
-        title=html.escape(APP_TITLE),
+        title=html.escape(app_title()),
         nav=_nav(),
         rows=rows or "<tr><td colspan=7 class=muted>No mail yet.</td></tr>",
         title_extra="",
@@ -390,14 +1031,19 @@ def inbox_all():
 
 @app.get("/inbox/{address}", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def inbox_for(address: str):
-    resp = table.query(
-        KeyConditionExpression=Key("recipient").eq(address.lower()),
-        ScanIndexForward=False,
-        Limit=100,
-    )
+    if not aws_ready():
+        return _backend_unconfigured()
+    try:
+        resp = table.query(
+            KeyConditionExpression=Key("recipient").eq(address.lower()),
+            ScanIndexForward=False,
+            Limit=100,
+        )
+    except Exception as exc:
+        return _backend_error(exc)
     rows = "".join(_row(m) for m in resp.get("Items", []))
     return PAGE.format(
-        title=html.escape(APP_TITLE),
+        title=html.escape(app_title()),
         nav=_nav(),
         rows=rows or "<tr><td colspan=7 class=muted>No mail.</td></tr>",
         title_extra=f" &mdash; {html.escape(address)}",
@@ -406,6 +1052,8 @@ def inbox_for(address: str):
 
 @app.get("/message/{message_id}", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def view_message(message_id: str, r: str = "", t: str = ""):
+    if not aws_ready():
+        return _backend_unconfigured()
     # Best-effort: mark this inbox row read. 'r'/'t' are the item's primary key,
     # carried from the inbox link. Needs dynamodb:UpdateItem; if the role lacks
     # it (or the key wasn't passed) the view still renders fine.
@@ -420,8 +1068,8 @@ def view_message(message_id: str, r: str = "", t: str = ""):
         except Exception:
             pass
 
-    key = f"{S3_PREFIX}{message_id}"
-    raw = s3.get_object(Bucket=BUCKET_NAME, Key=key)["Body"].read()
+    key = f"{CONFIG['s3_prefix']}{message_id}"
+    raw = s3.get_object(Bucket=CONFIG["bucket_name"], Key=key)["Body"].read()
     msg = message_from_bytes(raw, policy=default_policy)
 
     body = msg.get_body(preferencelist=("html", "plain"))
@@ -483,7 +1131,7 @@ def view_message(message_id: str, r: str = "", t: str = ""):
         "<style>@media(max-width:600px){body{margin:1rem}}</style>"
         "<a href='/'>&larr; inbox</a>"
         + ("<a href='/logout' style='margin-left:1rem;font-size:13px'>Log out</a>"
-           if AUTH_ENABLED else "")
+           if auth_enabled() else "")
         + f"<span style='float:right'>{_delete_button(html.escape(message_id))}</span>"
         "<hr>"
         f"{meta}{rendered}"
@@ -503,7 +1151,7 @@ def _purge_messages(message_ids=None):
     start_key = None
     while True:
         kwargs = dict(
-            IndexName="global-index",
+            IndexName=CONFIG["dynamodb_index"],
             KeyConditionExpression=Key("inbox").eq("ALL"),
         )
         if start_key:
@@ -523,7 +1171,10 @@ def _purge_messages(message_ids=None):
             if mid and mid not in deleted_from_s3:
                 deleted_from_s3.add(mid)
                 try:
-                    s3.delete_object(Bucket=BUCKET_NAME, Key=f"{S3_PREFIX}{mid}")
+                    s3.delete_object(
+                        Bucket=CONFIG["bucket_name"],
+                        Key=f"{CONFIG['s3_prefix']}{mid}",
+                    )
                 except Exception:
                     pass  # already gone / expired — index cleanup still runs
         start_key = resp.get("LastEvaluatedKey")
@@ -534,6 +1185,8 @@ def _purge_messages(message_ids=None):
 @app.post("/message/{message_id}/delete", dependencies=[Depends(require_login)])
 def delete_message(message_id: str):
     """Permanently remove a single message: the raw email in S3 and index rows."""
+    if not aws_ready():
+        return _backend_unconfigured()
     _purge_messages({message_id})
     # 303 -> browser re-requests the inbox with GET
     return RedirectResponse("/", status_code=303)
@@ -542,6 +1195,8 @@ def delete_message(message_id: str):
 @app.post("/messages/delete", dependencies=[Depends(require_login)])
 async def delete_messages(request: Request):
     """Bulk delete: the selected messageIds, or every message when 'all' is set."""
+    if not aws_ready():
+        return _backend_unconfigured()
     # Parse the urlencoded form body directly so we don't need python-multipart
     # (nothing else in this app parses form bodies). parse_qs returns each
     # field as a list, so 'ids' naturally collects every checked box.

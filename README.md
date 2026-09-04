@@ -3,61 +3,116 @@
 A small, portable web viewer for a catch-all SES inbox. It lists inbound emails
 (indexed in DynamoDB) and renders message bodies (stored in S3 by Amazon SES).
 
-Built to be cloned and run by anyone: **every operational setting is an
-environment variable**, the same container image runs locally, on Docker, or on
-AWS unchanged, and an optional login is built in.
+Built to be cloned and run by anyone: **almost everything is configured through
+the UI at `/settings`** and persisted to a small config file, so the same
+container image runs locally, in your homelab, or on AWS unchanged. Optional
+single sign-on (OIDC / Authentik) is built in.
 
 > This repo is just the viewer app. The AWS backend it reads from (SES receiving
-> rule, S3 bucket, DynamoDB table + `global-index`, and the indexer Lambda) is
-> assumed to already exist. Point the app at your own resources via env vars.
+> rule, S3 bucket, DynamoDB table + its feed index, and the indexer Lambda) is
+> assumed to already exist. Point the app at your own resources from `/settings`.
 
 ## Repo layout
 
 ```
-app.py               FastAPI viewer + OIDC (Authentik SSO) login
+app.py               FastAPI viewer + UI settings + OIDC (Authentik SSO) login
 requirements.txt     Pinned Python deps
-Dockerfile           python:3.12-slim, non-root, with healthcheck
-docker-compose.yml   For local / homelab runs
-.env.example         Copy to .env and fill in
+Dockerfile           python:3.12-slim, non-root, /data volume, healthcheck
+docker-compose.yml   For local / homelab runs (mounts a viewer-data volume)
+.env.example         Copy to .env and fill in the few bootstrap vars
 .dockerignore / .gitignore
 ```
 
-## Configuration
+## Configuration model
 
-Everything is environment-driven. Copy `.env.example` to `.env` and fill it in.
+There are two layers:
+
+1. **The `/settings` page (primary).** The AWS wiring, AWS credentials, the app
+   title, and OIDC single sign-on are all set here and saved to `CONFIG_FILE`
+   (default `/data/config.json`, mode `0600`). Changes take effect immediately —
+   no restart. The compose file mounts a `viewer-data` volume at `/data` so the
+   config survives container recreation.
+2. **Environment variables (seeds + bootstrap).** Every `/settings` field is also
+   read from a matching env var **on first boot**, so an unattended / env-driven
+   deployment still works. Once you save in the UI, the stored file wins.
+
+### What must stay in the environment
+
+Four "bootstrap" settings can't be moved into the UI, because each would be
+circular to configure through the very page it enables:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `AWS_DEFAULT_REGION` | yes | e.g. `us-east-1` |
-| `TABLE_NAME` | yes | DynamoDB table (e.g. `demoworldfun-messages`) |
-| `BUCKET_NAME` | yes | S3 bucket with the raw emails |
-| `S3_PREFIX` | no | Key prefix SES writes under (default `inbox/`) |
-| `APP_TITLE` | no | Branding shown in the header/login (default `inbox`) |
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | local only | **Leave blank on AWS**; use a role instead |
-| `OIDC_DISCOVERY_URL` | for login | Provider's `.well-known/openid-configuration` URL |
-| `OIDC_CLIENT_ID` | for login | OAuth2/OIDC client ID from the provider |
-| `OIDC_CLIENT_SECRET` | for login | OAuth2/OIDC client secret (store as a secret) |
-| `OIDC_REDIRECT_URI` | recommended | Exact callback URL registered with the provider (e.g. `https://host/auth/callback`) |
-| `OIDC_ALLOWED_GROUPS` | no | Comma-separated provider groups allowed in; empty = any authenticated user |
-| `SESSION_SECRET` | for login | Random string signing the session cookie |
-| `AUTH_DISABLED` | no | `true` to run with **no** login (local dev, or behind another auth proxy) |
-| `SECURE_COOKIES` | no | `true` when served over HTTPS |
-| `HOST_PORT` | compose only | Host port (default `8100`) |
+| `ADMIN_TOKEN` | **yes** | Unlocks `/settings`. If unset, the settings page is **disabled** (fail-closed) so an exposed instance can't have its auth reconfigured by a stranger. |
+| `SESSION_SECRET` | recommended | Signs the session cookie (incl. the admin unlock). Set it so the unlock and logins survive a restart; otherwise a random one is generated per process. |
+| `SECURE_COOKIES` | no | `true` when served over HTTPS (marks the session cookie `Secure`). A transport flag applied at startup. |
+| `CONFIG_FILE` | no | Where UI settings are stored (default `/data/config.json`). |
+| `HOST_PORT` | compose only | Host port (default `8100`). |
 
-## How AWS credentials work (important)
+The **minimal `.env` is just `ADMIN_TOKEN` (plus `SESSION_SECRET`)** — then
+configure everything else at `/settings`.
 
-**Credentials are supplied at deploy time, never through the UI.** The app uses
-the standard boto3 chain and resolves them automatically:
+### What you configure at `/settings` (env seeds shown in parentheses)
 
-- **Local / Docker:** put the scoped read-only keys in `.env`
-  (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
-- **On AWS (App Runner / ECS):** attach an instance/task role carrying the
-  read-only policy and **leave the key variables blank** — no keys travel with
-  the app at all.
+| Setting | Env seed | Notes |
+|---|---|---|
+| App title | `APP_TITLE` | Shown in the header / browser tab (default `inbox`) |
+| Region | `AWS_REGION` / `AWS_DEFAULT_REGION` | e.g. `us-east-1` |
+| DynamoDB table | `TABLE_NAME` | e.g. `demoworldfun-messages` |
+| DynamoDB index | `DYNAMODB_INDEX` | The global feed GSI (default `global-index`) |
+| S3 bucket | `BUCKET_NAME` | Bucket with the raw emails |
+| S3 prefix | `S3_PREFIX` | Key prefix SES writes under (default `inbox/`) |
+| Access key ID | `AWS_ACCESS_KEY_ID` | Blank → use a role / `~/.aws` (see below) |
+| Secret access key | `AWS_SECRET_ACCESS_KEY` | Stored `0600`, masked in the form |
+| Session token | `AWS_SESSION_TOKEN` | Only for temporary/SSO credentials |
+| Require SSO login | `AUTH_DISABLED` (`true` = off) | Toggle SSO on/off |
+| Discovery URL | `OIDC_DISCOVERY_URL` | Provider's `.well-known/openid-configuration` |
+| Client ID | `OIDC_CLIENT_ID` | OAuth2/OIDC client ID |
+| Client secret | `OIDC_CLIENT_SECRET` | Stored `0600`, masked in the form |
+| Redirect URI | `OIDC_REDIRECT_URI` | Exact callback registered with the provider |
+| Allowed groups | `OIDC_ALLOWED_GROUPS` | Comma-separated; empty = any authenticated user |
 
-This is deliberate. A viewer that accepted AWS keys through a form would have to
-store them, encrypt them at rest, and would push people toward long-lived keys
-over roles. Keeping credentials at the deployment boundary avoids all of that.
+Secret fields (client secret, AWS secret key, session token) are masked; leaving
+one blank on save **keeps the stored value** rather than wiping it.
+
+## The settings page
+
+Open `http://<host>:<port>/settings` (also linked top-right of the inbox).
+
+- **Unlocking.** You'll be asked for the `ADMIN_TOKEN`. It's stored in your signed
+  session; use **Lock settings** to clear it. This gate is deliberately separate
+  from SSO — SSO *is* the login, so the page that configures it can't be behind
+  that login.
+- **Save & test AWS.** Runs the exact operations the app uses — a DynamoDB
+  `Query` on the feed index, then an S3 `HeadObject` (same permission as
+  `GetObject`) on a real message key — and reports PASS/FAIL per check. Use it to
+  verify credentials and IAM permissions after entering them.
+- **Fail-closed behavior.** If SSO is enabled but not fully configured, the inbox
+  is blocked (you're sent to a "configure SSO" notice) rather than served without
+  a login. If the AWS backend isn't configured, the inbox shows a "set this up at
+  Settings" page (HTTP 503); if a backend call fails (wrong keys, missing IAM
+  permission), it shows the error and points at **Save & test AWS** (HTTP 502)
+  instead of a raw 500.
+
+## AWS credentials & IAM permissions
+
+The app resolves credentials in this order:
+
+1. **Keys entered at `/settings`** (or seeded from `AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`). Stored in the `0600` config
+   file on the `/data` volume.
+2. **Otherwise the standard boto3 chain** — ambient env vars, a mounted `~/.aws`,
+   or an instance/task role. **Leave the credential fields blank to use this.**
+
+Guidance by environment:
+
+- **On-prem / homelab:** create a dedicated IAM user with the policy below and
+  enter its access key at `/settings` (or seed it in `.env`). Prefer scoped,
+  rotate-able keys.
+- **On AWS (ECS / App Runner):** leave the credential fields blank and attach an
+  **instance/task role** carrying the policy — no long-lived keys travel with the
+  app at all.
+
 The IAM identity only ever needs:
 
 ```json
@@ -75,13 +130,20 @@ The IAM identity only ever needs:
 }
 ```
 
+`Query`/`UpdateItem`/`DeleteItem` cover listing, marking-read, and delete;
+`GetObject`/`DeleteObject` cover rendering and deleting message bodies. The
+**Save & test AWS** button deliberately checks only these — it does **not** need
+`ListBucket` or `DescribeTable`. (Adjust `global-index` if you set a different
+DynamoDB index.)
+
 ## Setting up the login (OIDC / Authentik SSO)
 
 The app authenticates users through an OpenID Connect provider using the
 Authorization Code flow. Unauthenticated visitors are bounced to the provider to
 sign in, then redirected back to `/auth/callback`, where the app verifies the
-token and creates its own session cookie. For local dev or when fronted by
-another auth proxy, set `AUTH_DISABLED=true` to skip login entirely.
+token and creates its own session cookie. Turn the **Require SSO login** toggle
+off at `/settings` (or set `AUTH_DISABLED=true`) to run without login — for local
+dev, or when fronted by another auth proxy.
 
 ### 1. Create the provider + application in Authentik
 
@@ -91,42 +153,28 @@ In your Authentik admin (`https://authtime.trevorcombs.com`):
    explicit/implicit consent. Client type: **Confidential**. Note the generated
    **Client ID** and **Client Secret**.
 2. Set the **Redirect URI** to your app's callback, e.g.
-   `https://<your-app-host>/auth/callback` (must match `OIDC_REDIRECT_URI`).
+   `https://<your-app-host>/auth/callback` (must match the Redirect URI you enter
+   in `/settings`). The settings page shows the callback it will use as a hint.
 3. **Applications → Create**, bind it to that provider, give it a slug. Access to
    this application (and any group bindings) is what governs who can log in.
 4. (Optional) To restrict by group inside the app too, add a **Scope Mapping**
    that emits `groups` and ensure the provider's scopes include it, then set
-   `OIDC_ALLOWED_GROUPS`.
+   **Allowed groups**.
 
 Your discovery URL is:
 `https://authtime.trevorcombs.com/application/o/<app-slug>/.well-known/openid-configuration`
 
 ### 2. Configure the app
 
-```bash
-# Generate a session secret (signs the local session cookie)
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Put these in `.env` (or ECS task env / secrets):
-
-```
-OIDC_DISCOVERY_URL=https://authtime.trevorcombs.com/application/o/<app-slug>/.well-known/openid-configuration
-OIDC_CLIENT_ID=...
-OIDC_CLIENT_SECRET=...
-OIDC_REDIRECT_URI=https://<your-app-host>/auth/callback
-OIDC_ALLOWED_GROUPS=inbox-admins        # optional
-SESSION_SECRET=...
-SECURE_COOKIES=true                      # whenever served over HTTPS
-```
+Enter the Discovery URL, Client ID, Client secret, Redirect URI, and (optionally)
+Allowed groups at `/settings`, turn on **Require SSO login**, and save. (Or seed
+the same values via the `OIDC_*` env vars.)
 
 Notes:
 
-- **`OIDC_CLIENT_SECRET` is a secret** — inject it via ECS Secrets/SSM Parameter
-  Store, not as plaintext in a committed file.
-- **`OIDC_REDIRECT_URI` must exactly match** what's registered in Authentik
-  (scheme, host, and path). Set it explicitly behind a load balancer so the
-  app doesn't guess the wrong scheme/host from proxied requests.
+- **The Redirect URI must exactly match** what's registered in Authentik (scheme,
+  host, and path). Set it explicitly behind a load balancer / reverse proxy so
+  the app doesn't guess the wrong scheme/host from proxied requests.
 - OAuth tokens travel over this URL — **serve the app over HTTPS** in anything
   but throwaway local testing, and set `SECURE_COOKIES=true` to match.
 - The app stores no passwords. Identity, MFA, and account lifecycle all live in
@@ -139,19 +187,29 @@ Notes:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # fill it in
-set -a && . ./.env && set +a  # load .env into the shell
+cp .env.example .env          # set at least ADMIN_TOKEN (+ SESSION_SECRET)
+export CONFIG_FILE=./config.json   # a writable path for local runs
+set -a && . ./.env && set +a       # load .env into the shell
 uvicorn app:app --reload --port 8000
-# http://localhost:8000
+# http://localhost:8000  → open /settings to finish configuration
+```
+
+Generate the bootstrap secrets with:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # run twice: ADMIN_TOKEN, SESSION_SECRET
 ```
 
 ### Docker / homelab (compose)
 
 ```bash
-cp .env.example .env          # fill it in
+cp .env.example .env          # set at least ADMIN_TOKEN (+ SESSION_SECRET)
 docker compose up -d --build
-# http://<host>:8100
+# http://<host>:8100  → open /settings to finish configuration
 ```
+
+The compose file mounts a named `viewer-data` volume at `/data`, so your saved
+settings (including credentials, `0600`) persist across `up`/`down`/rebuilds.
 
 ### Build a portable multi-arch image (no "Mac vs Linux")
 
@@ -166,8 +224,10 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## Host it on AWS
 
-The container is the unit of deployment — pick a service, the image and env
-contract stay identical.
+The container is the unit of deployment — pick a service, the image stays
+identical. On AWS you typically leave the AWS **credential** fields blank and use
+a role; still set `ADMIN_TOKEN` (and `SESSION_SECRET`, `SECURE_COOKIES=true`) as
+env, and persist `/data` so UI settings survive task restarts.
 
 ### App Runner (simplest)
 
@@ -180,15 +240,19 @@ docker buildx build --platform linux/amd64 \
   -t ${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/demoworldfun-viewer:latest --push .
 ```
 
-Then create an App Runner service from that image: port `8000`, health check
-path `/healthz`, add the env vars (`TABLE_NAME`, `BUCKET_NAME`, `APP_TITLE`,
-the `OIDC_*` / `SESSION_SECRET` set — **not** the AWS keys), assign an
-**instance role** with the read-only policy above, and set `SECURE_COOKIES=true`.
-You get a stable HTTPS URL out of the box.
+Then create an App Runner service from that image: port `8000`, health check path
+`/healthz`, set `ADMIN_TOKEN` / `SESSION_SECRET` / `SECURE_COOKIES=true` (and
+optionally seed the AWS + OIDC vars), assign an **instance role** with the
+read-only policy above, and configure the rest at `/settings`. You get a stable
+HTTPS URL out of the box. (Note: App Runner's filesystem is ephemeral — seed via
+env vars, or attach durable storage, if you don't want to re-enter settings after
+a redeploy.)
 
 ### ECS Fargate
 
-More control (your VPC, an ALB, custom domain), more setup. Same image and env.
+More control (your VPC, an ALB, custom domain), more setup. Same image; use a
+task role for credentials and an EFS mount for `/data` if you want UI settings to
+persist.
 
 ## Putting it in a repo
 
@@ -198,4 +262,5 @@ git remote add origin <remote>
 git push -u origin main
 ```
 
-`.env` is gitignored, so no secrets get committed — keep it that way.
+`.env` is gitignored, so no secrets get committed — keep it that way. The runtime
+config file (`/data/config.json`) lives on a volume, not in the repo.

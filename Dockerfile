@@ -9,6 +9,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Run as a non-root user
 RUN useradd --create-home --uid 10001 appuser
 COPY app.py .
+
+# Persisted UI settings (OIDC config) live here. Mount a volume at /data so the
+# config survives container recreation; the dir is owned by the non-root user so
+# the app can write it.
+RUN mkdir -p /data && chown appuser:appuser /data
+ENV CONFIG_FILE=/data/config.json
+VOLUME ["/data"]
+
 USER appuser
 
 EXPOSE 8000
