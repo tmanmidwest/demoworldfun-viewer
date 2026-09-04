@@ -6,9 +6,35 @@ services:
     restart: unless-stopped
     ports:
       - "${HOST_PORT:-8100}:8000"
-    env_file: .env
+    # No env_file: values come from variable substitution instead, so this works
+    # both with a local .env (Compose auto-loads it) and in Portainer (set these
+    # in the stack's "Environment variables" UI). Almost everything is configured
+    # in the app at /settings and persisted to the volume below -- the only value
+    # you really need to set is ADMIN_TOKEN (plus SESSION_SECRET). Everything else
+    # is an optional first-boot seed; leave it blank to configure it in /settings.
+    environment:
+      # ── Bootstrap (set these) ──
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-}
+      # ── Optional seeds (or set them at /settings) ──
+      APP_TITLE: ${APP_TITLE:-inbox}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
+      TABLE_NAME: ${TABLE_NAME:-}
+      DYNAMODB_INDEX: ${DYNAMODB_INDEX:-global-index}
+      BUCKET_NAME: ${BUCKET_NAME:-}
+      S3_PREFIX: ${S3_PREFIX:-inbox/}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AUTH_DISABLED: ${AUTH_DISABLED:-}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_ALLOWED_GROUPS: ${OIDC_ALLOWED_GROUPS:-}
     volumes:
-      # Persists UI-entered OIDC settings across container recreation.
+      # Persists UI-entered settings (AWS + OIDC config) across recreation.
       - viewer-data:/data
 
 volumes:
