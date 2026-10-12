@@ -12,4 +12,5 @@ __pycache__/
 # Runtime config written by the /settings UI (holds credentials). On a server
 # this lives on the /data volume; locally it may be written here via CONFIG_FILE.
 config.json
+admin.key
 data/

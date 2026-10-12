@@ -21,8 +21,10 @@ turn SSO off there to run open (local dev, or behind another auth proxy).
 """
 
 import os
+import sys
 import json
 import html
+import hashlib
 import logging
 import secrets
 import tempfile
@@ -42,16 +44,19 @@ log = logging.getLogger("viewer")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Almost everything is configured through the UI at /settings and persisted to
-# CONFIG_FILE. Only four "bootstrap" settings stay in the environment, because
-# each one would be circular to configure through the very page it enables:
-#   - ADMIN_TOKEN   unlocks /settings; it can't be set through the page it guards.
-#   - SESSION_SECRET signs the session cookie (incl. the admin unlock); changing
-#                    it would invalidate the session you're using, and it's
-#                    needed before /settings is even reachable.
-#   - CONFIG_FILE   is *where* UI settings are stored, so it can't be one of them.
+# Almost everything is configured through the setup wizard at /settings and
+# persisted to CONFIG_FILE. Nothing *has* to be set in the environment anymore:
+# the admin key that unlocks the wizard is generated on first boot (see the Admin
+# key section) and shown to you once. These environment settings remain optional:
+#   - ADMIN_TOKEN    pins the admin key to a fixed value instead of generating one
+#                    (declarative / power-user path). Leave it unset to use the
+#                    generated key.
+#   - SESSION_SECRET signs the session cookie (incl. the admin unlock). Set it so
+#                    logins and the admin unlock survive a restart; otherwise a
+#                    throwaway one is generated per process.
 #   - SECURE_COOKIES sets the cookie Secure flag at middleware init (a transport
 #                    fact -- are you behind HTTPS?); it isn't changeable per-save.
+#   - CONFIG_FILE    is *where* UI settings are stored, so it can't be one of them.
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
 SECURE_COOKIES = os.environ.get("SECURE_COOKIES", "").lower() in ("1", "true", "yes")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
@@ -110,6 +115,122 @@ _PERSISTED_KEYS = tuple(CONFIG.keys())
 
 # Secret fields: masked in the UI, and a blank form field means "keep existing".
 _SECRET_KEYS = ("oidc_client_secret", "aws_secret_access_key", "aws_session_token")
+
+
+# ---------------------------------------------------------------------------
+# Admin key -- gates the setup wizard / settings pages
+# ---------------------------------------------------------------------------
+# The wizard configures OIDC, which is the app's own login, so it can't be
+# protected by that login. It's gated by an "admin key" instead:
+#   - If ADMIN_TOKEN is set, that IS the admin key (nothing generated or stored).
+#   - Otherwise a strong key is generated on first boot, shown ONCE in the browser
+#     and printed ONCE to the container log, and only a hash is stored on the
+#     volume. The plaintext is never written to disk and can't be shown again;
+#     if it's lost, regenerate it from the CLI:
+#         docker exec <container> python app.py reset-admin-key
+ADMIN_KEY_FILE = os.environ.get(
+    "ADMIN_KEY_FILE",
+    os.path.join(os.path.dirname(CONFIG_FILE) or ".", "admin.key"),
+)
+
+_ADMIN_ENV_MODE = bool(ADMIN_TOKEN)   # admin key supplied via env, not generated
+_ADMIN_KEY_HASH = ""                  # stored hash (generated-key mode)
+_ADMIN_KEY_PLAINTEXT = None           # in-memory only, until revealed; never on disk
+_ADMIN_KEY_REVEALED = True            # env mode has nothing to reveal
+
+
+def _hash_admin_key(key: str) -> str:
+    return hashlib.sha256(("viewer-admin-key:" + key).encode("utf-8")).hexdigest()
+
+
+def _read_admin_key_file():
+    try:
+        with open(ADMIN_KEY_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def _write_admin_key_file(hash_hex: str, revealed: bool) -> None:
+    directory = os.path.dirname(ADMIN_KEY_FILE) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".adminkey-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"hash": hash_hex, "revealed": revealed}, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ADMIN_KEY_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _new_admin_key() -> str:
+    return secrets.token_urlsafe(30)
+
+
+def init_admin_key(generate_if_missing: bool = True) -> None:
+    """Resolve the admin key at startup. In env mode it's ADMIN_TOKEN; otherwise
+    load the stored hash, or generate a fresh key on first boot."""
+    global _ADMIN_KEY_HASH, _ADMIN_KEY_PLAINTEXT, _ADMIN_KEY_REVEALED
+    if _ADMIN_ENV_MODE:
+        _ADMIN_KEY_REVEALED = True
+        return
+    saved = _read_admin_key_file()
+    if saved and saved.get("hash"):
+        _ADMIN_KEY_HASH = saved["hash"]
+        _ADMIN_KEY_REVEALED = bool(saved.get("revealed", True))
+        _ADMIN_KEY_PLAINTEXT = None  # a stored key can't be recovered
+        return
+    if not generate_if_missing:
+        return
+    key = _new_admin_key()
+    _ADMIN_KEY_HASH = _hash_admin_key(key)
+    _ADMIN_KEY_PLAINTEXT = key
+    _ADMIN_KEY_REVEALED = False
+    _write_admin_key_file(_ADMIN_KEY_HASH, revealed=False)
+    bar = "=" * 60
+    log.warning("\n%s\nADMIN KEY generated on first boot -- save it now (shown once):"
+                "\n\n    %s\n\nThe app will also show it once in the browser. Lost it?"
+                "\n  docker exec <container> python app.py reset-admin-key\n%s",
+                bar, key, bar)
+
+
+def reset_admin_key() -> str:
+    """Generate a new admin key, store its hash, mark delivered. Returns plaintext."""
+    global _ADMIN_KEY_HASH, _ADMIN_KEY_PLAINTEXT, _ADMIN_KEY_REVEALED
+    key = _new_admin_key()
+    _ADMIN_KEY_HASH = _hash_admin_key(key)
+    _ADMIN_KEY_PLAINTEXT = None
+    _ADMIN_KEY_REVEALED = True
+    _write_admin_key_file(_ADMIN_KEY_HASH, revealed=True)
+    return key
+
+
+def check_admin_key(entered: str) -> bool:
+    """Constant-time check of an entered key against the env token or stored hash."""
+    if _ADMIN_ENV_MODE:
+        return secrets.compare_digest(entered or "", ADMIN_TOKEN)
+    if not _ADMIN_KEY_HASH:
+        return False
+    return secrets.compare_digest(_hash_admin_key(entered or ""), _ADMIN_KEY_HASH)
+
+
+def admin_key_pending_reveal() -> bool:
+    """True when a freshly generated key is waiting to be shown once."""
+    return (not _ADMIN_ENV_MODE) and (not _ADMIN_KEY_REVEALED) and bool(_ADMIN_KEY_PLAINTEXT)
+
+
+def mark_admin_key_revealed() -> None:
+    """Record that the key has been shown; drop the in-memory plaintext for good."""
+    global _ADMIN_KEY_PLAINTEXT, _ADMIN_KEY_REVEALED
+    _ADMIN_KEY_REVEALED = True
+    _ADMIN_KEY_PLAINTEXT = None
+    if _ADMIN_KEY_HASH:
+        _write_admin_key_file(_ADMIN_KEY_HASH, revealed=True)
 
 
 def app_title() -> str:
@@ -277,6 +398,9 @@ def _test_aws():
 _load_persisted_config()
 configure_oauth()
 build_aws_clients()
+# Don't auto-generate a key when run as a CLI command (e.g. reset-admin-key);
+# the command handles key creation itself.
+init_admin_key(generate_if_missing=(__name__ != "__main__"))
 
 app = FastAPI(title="inbox")
 app.add_middleware(
@@ -323,7 +447,7 @@ def _group_allowed(userinfo: dict) -> bool:
 
 
 def admin_ok(request: Request) -> bool:
-    """Whether this session has unlocked the settings page with ADMIN_TOKEN."""
+    """Whether this session has unlocked the settings page with the admin key."""
     return bool(request.session.get("is_admin"))
 
 
@@ -505,23 +629,38 @@ LOGGED_OUT_PAGE = """<!doctype html><meta charset=utf-8>
 </div>"""
 
 
-# Shown when ADMIN_TOKEN is not set: the settings page is fail-closed.
-SETTINGS_DISABLED_PAGE = """<!doctype html><meta charset=utf-8>
+# One-time reveal of a freshly generated admin key (first boot only).
+KEY_REVEAL_PAGE = """<!doctype html><meta charset=utf-8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} &mdash; settings unavailable</title>
+<title>{title} &mdash; save your admin key</title>
 <style>
- body{{font:14px system-ui,sans-serif;margin:2rem;max-width:640px}}
+ body{{font:14px system-ui,sans-serif;margin:0;display:flex;justify-content:center}}
+ .wrap{{max-width:560px;padding:2rem 1.2rem}}
+ h2{{margin:0 0 .3rem}}
+ .key{{font:16px ui-monospace,Menlo,Consolas,monospace;background:#0b1021;color:#eef;
+       padding:1rem;border-radius:8px;word-break:break-all;user-select:all;margin:1rem 0}}
+ .warn{{background:#fffbe6;border:1px solid #ecd9a0;border-radius:8px;
+        padding:.8rem 1rem;font-size:13px;color:#7a5c00;margin:1rem 0}}
+ button{{padding:.6rem 1.2rem;border:0;border-radius:4px;background:#0645ad;
+         color:#fff;font-size:14px;cursor:pointer}}
  code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}}
- .card{{border:1px solid #e0b4b4;border-radius:8px;padding:1.2rem 1.4rem;background:#fdf7f7}}
+ .muted{{color:#777;font-size:12px}}
 </style>
-<p><a href='/'>&larr; inbox</a></p>
-<h2>Settings are locked</h2>
-<div class=card>
- <p>The settings page is disabled because no <code>ADMIN_TOKEN</code> is set.</p>
- <p>Set an <code>ADMIN_TOKEN</code> in the container's environment (for example in
-    your <code>.env</code> / compose file) and restart. That token is what unlocks
-    this page, so OIDC &mdash; which is itself the login &mdash; can be configured
-    here safely.</p>
+<div class=wrap>
+ <h2>Welcome &mdash; here's your admin key</h2>
+ <p>This key unlocks setup and settings. <b>It is shown only once.</b> Copy it into
+    your password manager now.</p>
+ <div class=key>{key}</div>
+ <div class=warn>
+  <b>Security:</b> if you did <i>not</i> just install this app, someone else may
+  have seen this key. Reset it immediately:
+  <br><code>docker exec &lt;container&gt; python app.py reset-admin-key</code>
+ </div>
+ <form method=post action='/setup/key'>
+  <button type=submit>I've saved it &mdash; start setup &rarr;</button>
+ </form>
+ <p class=muted>Lost it later? It can't be recovered &mdash; regenerate it with the
+    same command above.</p>
 </div>"""
 
 
@@ -531,7 +670,7 @@ UNLOCK_PAGE = """<!doctype html><meta charset=utf-8>
 <style>
  body{{font:14px system-ui,sans-serif;display:flex;justify-content:center;
        align-items:center;min-height:90vh;margin:0}}
- .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:300px}}
+ .card{{border:1px solid #ddd;border-radius:8px;padding:2rem;width:320px}}
  h2{{margin:0 0 1rem;text-align:center}}
  label{{display:block;font-size:13px;color:#444;margin:0 0 .3rem}}
  input{{width:100%;box-sizing:border-box;padding:.5rem;border:1px solid #ccc;
@@ -539,52 +678,64 @@ UNLOCK_PAGE = """<!doctype html><meta charset=utf-8>
  button{{margin-top:1rem;width:100%;padding:.6rem;border:0;border-radius:4px;
          background:#0645ad;color:#fff;font-size:14px;cursor:pointer}}
  .err{{color:#b00;font-size:13px;min-height:1.2em;margin:.4rem 0}}
+ .hint{{color:#888;font-size:12px;margin-top:.8rem}}
+ code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px;word-break:break-all}}
 </style>
 <form class=card method=post action='/settings/unlock'>
  <h2>Unlock settings</h2>
  <div class=err>{error}</div>
- <label for=token>Admin token</label>
+ <label for=token>Admin key</label>
  <input id=token name=token type=password autofocus autocomplete=off>
  <button type=submit>Unlock</button>
+ <p class=hint>{source_hint}</p>
 </form>"""
 
 
-SETTINGS_PAGE = """<!doctype html><meta charset=utf-8>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} &mdash; settings</title>
-<style>
- body{{font:14px system-ui,sans-serif;margin:2rem;max-width:680px}}
- a{{color:#0645ad;text-decoration:none}}
- fieldset{{border:1px solid #ddd;border-radius:8px;padding:1rem 1.2rem;margin:1.2rem 0}}
- legend{{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666;padding:0 .4rem}}
- label{{display:block;font-size:13px;color:#333;margin:.9rem 0 .3rem;font-weight:600}}
- .hint{{font-weight:400;color:#888;font-size:12px}}
- input[type=text],input[type=url],input[type=password]{{width:100%;box-sizing:border-box;
-   padding:.5rem;border:1px solid #ccc;border-radius:4px;font-size:14px}}
- .row{{display:flex;align-items:center;gap:.5rem;margin:.4rem 0}}
- .row label{{margin:0;font-weight:600}}
- button{{padding:.55rem 1.1rem;border:0;border-radius:4px;background:#0645ad;
-         color:#fff;font-size:14px;cursor:pointer}}
- .ok{{color:#0a7a34;font-size:13px;min-height:1.2em}}
- .warn{{background:#fffbe6;border:1px solid #ecd9a0;border-radius:6px;
-        padding:.6rem .8rem;font-size:13px;color:#7a5c00;margin:.6rem 0}}
- code{{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px}}
- .grid2{{display:grid;grid-template-columns:1fr 1fr;gap:0 1rem}}
- @media (max-width:560px){{.grid2{{grid-template-columns:1fr}}}}
- .test{{border:1px solid #ddd;border-radius:8px;padding:.6rem .9rem;margin:.6rem 0;
-        font-size:13px}}
- .test .pass{{color:#0a7a34}} .test .fail{{color:#b00}}
- .test li{{margin:.25rem 0;list-style:none}}
- .test ul{{padding-left:0;margin:.3rem 0}}
- .buttons{{display:flex;gap:.6rem;flex-wrap:wrap}}
- .buttons button.secondary{{background:#fff;color:#0645ad;border:1px solid #0645ad}}
-</style>
-<p><a href='/'>&larr; inbox</a> &nbsp;·&nbsp; <a href='/settings/lock'>Lock settings</a></p>
-<h2>{title} &mdash; settings</h2>
-<div class=ok>{status}</div>
-{state_banner}
-{aws_test}
-<form method=post action='/settings'>
+# Shared stylesheet for the wizard/settings pages. Kept as a plain value (not a
+# format template) so its CSS braces need no escaping -- it's injected via {css}.
+SET_CSS = """<style>
+ body{font:14px system-ui,sans-serif;margin:2rem;max-width:680px}
+ a{color:#0645ad;text-decoration:none}
+ h2{margin:.2rem 0}
+ fieldset{border:1px solid #ddd;border-radius:8px;padding:1rem 1.2rem;margin:1.2rem 0}
+ legend{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#666;padding:0 .4rem}
+ label{display:block;font-size:13px;color:#333;margin:.9rem 0 .3rem;font-weight:600}
+ .hint{font-weight:400;color:#888;font-size:12px}
+ input[type=text],input[type=url],input[type=password]{width:100%;box-sizing:border-box;
+   padding:.5rem;border:1px solid #ccc;border-radius:4px;font-size:14px}
+ .row{display:flex;align-items:center;gap:.5rem;margin:.4rem 0}
+ .row label{margin:0;font-weight:600}
+ button{padding:.55rem 1.1rem;border:0;border-radius:4px;background:#0645ad;
+        color:#fff;font-size:14px;cursor:pointer}
+ .ok{color:#0a7a34;font-size:13px;min-height:1.2em;font-weight:600}
+ .warn{background:#fffbe6;border:1px solid #ecd9a0;border-radius:6px;
+       padding:.6rem .8rem;font-size:13px;color:#7a5c00;margin:.6rem 0}
+ code{background:#f4f4f4;padding:.1rem .3rem;border-radius:3px;word-break:break-all}
+ .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 1rem}
+ @media (max-width:560px){.grid2{grid-template-columns:1fr}}
+ .test{border:1px solid #ddd;border-radius:8px;padding:.6rem .9rem;margin:.6rem 0;font-size:13px}
+ .test .pass{color:#0a7a34} .test .fail{color:#b00}
+ .test li{margin:.25rem 0;list-style:none} .test ul{padding-left:0;margin:.3rem 0}
+ .buttons{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1rem;align-items:center}
+ .buttons .secondary{background:#fff;color:#0645ad;border:1px solid #0645ad;
+   text-decoration:none;display:inline-block;padding:.5rem 1.1rem;border-radius:4px}
+ .topnav{font-size:13px;margin-bottom:.4rem}
+ .steps{display:flex;gap:.6rem;font-size:12px;color:#aaa;margin:.5rem 0 1rem}
+ .steps b{color:#0645ad} .steps .done{color:#0a7a34}
+ .cards{display:flex;flex-direction:column;gap:.8rem;margin:1.2rem 0}
+ .scard{border:1px solid #ddd;border-radius:8px;padding:.9rem 1.1rem;display:flex;
+   justify-content:space-between;align-items:center;gap:1rem}
+ .scard .meta{font-size:12px;color:#777;margin-top:.25rem}
+ .badge{font-size:11px;padding:.1rem .55rem;border-radius:999px;margin-left:.3rem;
+   vertical-align:middle}
+ .badge.good{background:#e6f5ec;color:#0a7a34}
+ .badge.bad{background:#fdecec;color:#b00}
+ .badge.off{background:#eee;color:#666}
+</style>"""
+
+
+# Fields shared by the AWS step (General + AWS backend fieldsets).
+_AWS_FIELDS_HTML = """
  <fieldset>
   <legend>General</legend>
   <label for=apptitle>App title
@@ -594,87 +745,118 @@ SETTINGS_PAGE = """<!doctype html><meta charset=utf-8>
  <fieldset>
   <legend>AWS backend (DynamoDB + S3)</legend>
   <div class=grid2>
-   <div>
-    <label for=region>Region</label>
-    <input id=region name=aws_region type=text value="{aws_region}" placeholder="us-east-1">
-   </div>
-   <div>
-    <label for=index>DynamoDB index
-     <span class=hint>the feed GSI</span></label>
-    <input id=index name=dynamodb_index type=text value="{dynamodb_index}" placeholder="global-index">
-   </div>
-   <div>
-    <label for=table>DynamoDB table</label>
-    <input id=table name=table_name type=text value="{table_name}" placeholder="demoworldfun-messages">
-   </div>
-   <div>
-    <label for=bucket>S3 bucket</label>
-    <input id=bucket name=bucket_name type=text value="{bucket_name}" placeholder="demoworldfun-inbound-mail">
-   </div>
-   <div>
-    <label for=prefix>S3 prefix</label>
-    <input id=prefix name=s3_prefix type=text value="{s3_prefix}" placeholder="inbox/">
-   </div>
+   <div><label for=region>Region</label>
+    <input id=region name=aws_region type=text value="{aws_region}" placeholder="us-east-1"></div>
+   <div><label for=index>DynamoDB index <span class=hint>the feed GSI</span></label>
+    <input id=index name=dynamodb_index type=text value="{dynamodb_index}" placeholder="global-index"></div>
+   <div><label for=table>DynamoDB table</label>
+    <input id=table name=table_name type=text value="{table_name}" placeholder="demoworldfun-messages"></div>
+   <div><label for=bucket>S3 bucket</label>
+    <input id=bucket name=bucket_name type=text value="{bucket_name}" placeholder="demoworldfun-inbound-mail"></div>
+   <div><label for=prefix>S3 prefix</label>
+    <input id=prefix name=s3_prefix type=text value="{s3_prefix}" placeholder="inbox/"></div>
   </div>
-
   <label for=akid>Access key ID
    <span class=hint>leave all three credential fields blank to use an instance/task
      role or a mounted ~/.aws instead</span></label>
   <input id=akid name=aws_access_key_id type=text value="{aws_access_key_id}" autocomplete=off>
-
-  <label for=asak>Secret access key
-   <span class=hint>{aws_secret_hint}</span></label>
+  <label for=asak>Secret access key <span class=hint>{aws_secret_hint}</span></label>
   <input id=asak name=aws_secret_access_key type=password value=""
     autocomplete=off placeholder="{aws_secret_placeholder}">
-
   <label for=astok>Session token
    <span class=hint>only for temporary/SSO credentials; {aws_token_hint}</span></label>
   <input id=astok name=aws_session_token type=password value=""
     autocomplete=off placeholder="{aws_token_placeholder}">
-
   <p class=hint>The IAM identity needs, at minimum:
      <code>dynamodb:Query</code>, <code>UpdateItem</code>, <code>DeleteItem</code>
-     on the table + its index, and <code>s3:GetObject</code>,
-     <code>DeleteObject</code> on the bucket. Use &ldquo;Save &amp; test&rdquo;
-     below to verify.</p>
- </fieldset>
+     on the table + its index, and <code>s3:GetObject</code>, <code>DeleteObject</code>
+     on the bucket. Use &ldquo;Test connection&rdquo; to verify.</p>
+ </fieldset>"""
+
+
+_SSO_FIELDS_HTML = """
  <fieldset>
   <legend>Single sign-on (OpenID Connect / Authentik)</legend>
   <div class=row>
    <input id=enable name=auth_enabled type=checkbox value=1 {enabled_checked}>
    <label for=enable>Require SSO login</label>
   </div>
-  <p class=hint>When unchecked, the app runs with no login (anyone who can reach
-     it sees the inbox). Leave it on for anything beyond a trusted LAN.</p>
-
+  <p class=hint>When unchecked, the app runs with no login (anyone who can reach it
+     sees the inbox). Leave it on for anything beyond a trusted LAN.</p>
   <label for=disc>Discovery URL
    <span class=hint>Authentik: Provider &rarr; OpenID Configuration URL</span></label>
   <input id=disc name=oidc_discovery_url type=url value="{discovery}"
     placeholder="https://authtime.example.com/application/o/&lt;slug&gt;/.well-known/openid-configuration">
-
   <label for=cid>Client ID</label>
   <input id=cid name=oidc_client_id type=text value="{client_id}" autocomplete=off>
-
-  <label for=csec>Client secret
-   <span class=hint>{secret_hint}</span></label>
+  <label for=csec>Client secret <span class=hint>{secret_hint}</span></label>
   <input id=csec name=oidc_client_secret type=password value=""
     autocomplete=off placeholder="{secret_placeholder}">
-
   <label for=redir>Redirect URI
    <span class=hint>Must EXACTLY match the one registered in Authentik</span></label>
   <input id=redir name=oidc_redirect_uri type=url value="{redirect_uri}"
     placeholder="{redirect_suggestion}">
-  <p class=hint>This app's callback path is <code>/auth/callback</code>. Based on
-     how you reached this page, that is likely
-     <code>{redirect_suggestion}</code>.</p>
-
+  <p class=hint>This app's callback path is <code>/auth/callback</code> &mdash; based on
+     how you reached this page, likely <code>{redirect_suggestion}</code>.</p>
   <label for=groups>Allowed groups
    <span class=hint>comma-separated; blank = any authenticated user</span></label>
   <input id=groups name=oidc_allowed_groups type=text value="{allowed_groups}">
- </fieldset>
+ </fieldset>"""
+
+
+OVERVIEW_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; settings</title>{css}
+<div class=topnav><a href='/'>&larr; inbox</a> &nbsp;·&nbsp; <a href='/settings/lock'>Lock settings</a></div>
+<h2>{title} &mdash; settings</h2>
+<div class=ok>{status}</div>
+{state_banner}
+<div class=cards>
+ <div class=scard>
+  <div><b>AWS backend</b>{aws_badge}<div class=meta>{aws_meta}</div></div>
+  <a class=secondary href='/settings/aws'>{aws_action}</a>
+ </div>
+ <div class=scard>
+  <div><b>Single sign-on</b>{sso_badge}<div class=meta>{sso_meta}</div></div>
+  <a class=secondary href='/settings/sso'>{sso_action}</a>
+ </div>
+</div>
+<fieldset>
+ <legend>Admin key</legend>
+ <p class=hint>{admin_key_note}</p>
+</fieldset>"""
+
+
+AWS_STEP_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; AWS backend</title>{css}
+<div class=topnav><a href='/settings'>&larr; settings</a> &nbsp;·&nbsp; <a href='/'>inbox</a></div>
+<h2>AWS backend</h2>
+<div class=steps><b>1 &middot; AWS backend</b><span>&rarr;</span><span>2 &middot; Single sign-on</span></div>
+<div class=ok>{status}</div>
+{state_banner}
+{aws_test}
+<form method=post action='/settings/aws'>""" + _AWS_FIELDS_HTML + """
+ <div class=buttons>
+  <button type=submit name=action value=test class=secondary>Test connection</button>
+  <button type=submit name=action value=save>Save</button>
+  <button type=submit name=action value=continue>Save &amp; continue &rarr;</button>
+ </div>
+</form>"""
+
+
+SSO_STEP_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; single sign-on</title>{css}
+<div class=topnav><a href='/settings'>&larr; settings</a> &nbsp;·&nbsp; <a href='/'>inbox</a></div>
+<h2>Single sign-on</h2>
+<div class=steps><span class=done>1 &middot; AWS backend &#10003;</span><span>&rarr;</span><b>2 &middot; Single sign-on</b></div>
+<div class=ok>{status}</div>
+{state_banner}
+<form method=post action='/settings/sso'>""" + _SSO_FIELDS_HTML + """
  <div class=buttons>
   <button type=submit name=action value=save>Save</button>
-  <button type=submit name=action value=save_test class=secondary>Save &amp; test AWS</button>
+  <button type=submit name=action value=finish>Save &amp; finish &rarr;</button>
  </div>
 </form>"""
 
@@ -771,21 +953,19 @@ def logged_out():
 
 
 # ---------------------------------------------------------------------------
-# Settings (OIDC configured through the UI)
+# Settings / setup wizard (AWS + OIDC configured through the UI)
 # ---------------------------------------------------------------------------
-# Access is gated by ADMIN_TOKEN, NOT by SSO -- SSO is the very thing configured
-# here, so it can't protect its own setup page. If ADMIN_TOKEN is unset the page
-# is disabled (fail closed) so an exposed instance can't have its auth hijacked.
+# Access is gated by the admin KEY, NOT by SSO -- SSO is the very thing configured
+# here, so it can't protect its own setup page. The key is generated on first boot
+# (shown once) or pinned via ADMIN_TOKEN; see the Admin key section above.
 def _admin_guard(request: Request):
-    """Return None if allowed, else a Response to send instead (locked/unlock)."""
-    if not ADMIN_TOKEN:
-        return HTMLResponse(
-            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
-            status_code=403,
-        )
-    if not admin_ok(request):
-        return RedirectResponse("/settings/unlock", status_code=302)
-    return None
+    """Return None if allowed, else a Response to send instead (reveal / unlock)."""
+    if admin_ok(request):
+        return None
+    # First boot: a freshly generated key hasn't been shown yet -> show it once.
+    if admin_key_pending_reveal():
+        return RedirectResponse("/setup/key", status_code=302)
+    return RedirectResponse("/settings/unlock", status_code=302)
 
 
 def _redirect_suggestion(request: Request) -> str:
@@ -795,35 +975,63 @@ def _redirect_suggestion(request: Request) -> str:
         return "https://your-app-host/auth/callback"
 
 
-@app.get("/settings/unlock", response_class=HTMLResponse)
-def settings_unlock_form(request: Request, error: str = ""):
-    if not ADMIN_TOKEN:
+@app.get("/setup/key", response_class=HTMLResponse)
+def setup_key_form(request: Request):
+    """One-time reveal of a freshly generated admin key."""
+    if admin_key_pending_reveal():
         return HTMLResponse(
-            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
-            status_code=403,
+            KEY_REVEAL_PAGE.format(
+                title=html.escape(app_title()),
+                key=html.escape(_ADMIN_KEY_PLAINTEXT or "", quote=True),
+            )
         )
+    # Nothing to reveal: either already shown, env-pinned, or lost on a restart.
     if admin_ok(request):
         return RedirectResponse("/settings", status_code=302)
-    msg = "Incorrect admin token." if error else ""
+    return RedirectResponse("/settings/unlock", status_code=302)
+
+
+@app.post("/setup/key")
+async def setup_key_ack(request: Request):
+    """'I've saved it' -> mark revealed, unlock this session, start the wizard."""
+    if admin_key_pending_reveal():
+        mark_admin_key_revealed()
+        request.session["is_admin"] = True
+        return RedirectResponse("/settings", status_code=303)
+    return RedirectResponse("/settings/unlock", status_code=303)
+
+
+@app.get("/settings/unlock", response_class=HTMLResponse)
+def settings_unlock_form(request: Request, error: str = ""):
+    if admin_ok(request):
+        return RedirectResponse("/settings", status_code=302)
+    if admin_key_pending_reveal():
+        return RedirectResponse("/setup/key", status_code=302)
+    msg = "Incorrect admin key." if error else ""
     return HTMLResponse(
-        UNLOCK_PAGE.format(title=html.escape(app_title()), error=html.escape(msg))
+        UNLOCK_PAGE.format(
+            title=html.escape(app_title()),
+            error=html.escape(msg),
+            source_hint=_unlock_source_hint(),
+        )
     )
 
 
 @app.post("/settings/unlock")
 async def settings_unlock(request: Request):
-    if not ADMIN_TOKEN:
-        return HTMLResponse(
-            SETTINGS_DISABLED_PAGE.format(title=html.escape(app_title())),
-            status_code=403,
-        )
     fields = parse_qs((await request.body()).decode("utf-8"))
-    token = (fields.get("token", [""])[0])
-    # Constant-time compare so a wrong token can't be guessed by timing.
-    if secrets.compare_digest(token, ADMIN_TOKEN):
+    key = fields.get("token", [""])[0]
+    if check_admin_key(key):
         request.session["is_admin"] = True
         return RedirectResponse("/settings", status_code=303)
     return RedirectResponse("/settings/unlock?error=1", status_code=303)
+
+
+def _unlock_source_hint() -> str:
+    if _ADMIN_ENV_MODE:
+        return "This is the <code>ADMIN_TOKEN</code> set in the container environment."
+    return ("The key shown once on first boot. Lost it? Run "
+            "<code>docker exec &lt;container&gt; python app.py reset-admin-key</code>.")
 
 
 @app.get("/settings/lock")
@@ -853,49 +1061,116 @@ def _test_block_html(checks) -> str:
             + "".join(items) + "</ul></div>")
 
 
-def _render_settings(request: Request, status: str = "", checks=None) -> HTMLResponse:
-    banners = []
-    if auth_enabled() and not oidc_ready():
-        banners.append("<div class=warn>SSO is <b>on</b> but not fully configured, "
-                       "so the inbox is currently blocked. Complete the SSO fields "
-                       "and save, or turn off &ldquo;Require SSO login&rdquo;.</div>")
-    elif not auth_enabled():
-        banners.append("<div class=warn>SSO is <b>off</b> &mdash; the inbox is open "
-                       "to anyone who can reach this app.</div>")
+def _esc_cfg(key: str) -> str:
+    return html.escape(CONFIG[key], quote=True)
+
+
+def _nothing_configured() -> bool:
+    """True on a brand-new install: no AWS wiring and no OIDC set up yet."""
+    return not any((
+        CONFIG["table_name"], CONFIG["bucket_name"], CONFIG["aws_region"],
+        CONFIG["oidc_discovery_url"],
+    ))
+
+
+def _render_overview(request: Request, status: str = "") -> HTMLResponse:
+    # AWS status
+    if aws_ready():
+        aws_badge = "<span class='badge good'>Configured</span>"
+        aws_meta = " &middot; ".join(filter(None, [
+            html.escape(CONFIG["aws_region"] or "?region"),
+            html.escape(CONFIG["table_name"] or "?table"),
+            html.escape(CONFIG["bucket_name"] or "?bucket"),
+        ]))
+        aws_action = "Edit"
+    else:
+        aws_badge = "<span class='badge bad'>Not set up</span>"
+        aws_meta = html.escape(AWS_ERROR) if AWS_ERROR else "region, table and bucket needed"
+        aws_action = "Set up"
+
+    # SSO status
+    if not auth_enabled():
+        sso_badge = "<span class='badge off'>Disabled</span>"
+        sso_meta = "no login required &mdash; anyone who can reach the app sees the inbox"
+        sso_action = "Set up"
+    elif oidc_ready():
+        sso_badge = "<span class='badge good'>Enabled</span>"
+        host = ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(CONFIG["oidc_discovery_url"]).netloc
+        except Exception:
+            pass
+        sso_meta = "login via " + (html.escape(host) or "OIDC provider")
+        sso_action = "Edit"
+    else:
+        sso_badge = "<span class='badge bad'>Incomplete</span>"
+        sso_meta = "SSO is on but not fully configured &mdash; the inbox is blocked"
+        sso_action = "Finish"
+
+    if _ADMIN_ENV_MODE:
+        admin_note = ("The admin key is pinned via <code>ADMIN_TOKEN</code> in the "
+                      "container environment.")
+    else:
+        admin_note = ("Generated on first boot and shown once. Lost it? It can't be "
+                      "recovered &mdash; issue a new one with "
+                      "<code>docker exec &lt;container&gt; python app.py reset-admin-key</code>.")
+
+    banner = ""
+    if not _nothing_configured() and auth_enabled() and not oidc_ready():
+        banner = ("<div class=warn>SSO is on but incomplete, so the inbox is blocked. "
+                  "Finish the SSO step or turn SSO off.</div>")
+
+    page = OVERVIEW_PAGE.format(
+        title=html.escape(app_title()), status=html.escape(status),
+        css=SET_CSS,
+        state_banner=banner,
+        aws_badge=aws_badge, aws_meta=aws_meta, aws_action=aws_action,
+        sso_badge=sso_badge, sso_meta=sso_meta, sso_action=sso_action,
+        admin_key_note=admin_note,
+    )
+    return HTMLResponse(page)
+
+
+def _render_aws_step(request: Request, status: str = "", checks=None) -> HTMLResponse:
+    banner = ""
     if not aws_ready():
         why = f" ({html.escape(AWS_ERROR)})" if AWS_ERROR else ""
-        banners.append("<div class=warn>AWS backend is <b>not configured</b>"
-                       f"{why} &mdash; set the region, table and bucket below.</div>")
+        banner = ("<div class=warn>AWS backend is <b>not configured yet</b>"
+                  f"{why}. Fill in the region, table and bucket below.</div>")
+    sec_hint, sec_ph = _secret_ui("aws_secret_access_key")
+    tok_hint, tok_ph = _secret_ui("aws_session_token")
+    page = AWS_STEP_PAGE.format(
+        title=html.escape(app_title()), status=html.escape(status),
+        css=SET_CSS,
+        state_banner=banner, aws_test=_test_block_html(checks),
+        app_title=_esc_cfg("app_title"), aws_region=_esc_cfg("aws_region"),
+        dynamodb_index=_esc_cfg("dynamodb_index"), table_name=_esc_cfg("table_name"),
+        bucket_name=_esc_cfg("bucket_name"), s3_prefix=_esc_cfg("s3_prefix"),
+        aws_access_key_id=_esc_cfg("aws_access_key_id"),
+        aws_secret_hint=sec_hint, aws_secret_placeholder=sec_ph,
+        aws_token_hint=tok_hint, aws_token_placeholder=tok_ph,
+    )
+    return HTMLResponse(page)
 
-    aws_secret_hint, aws_secret_ph = _secret_ui("aws_secret_access_key")
-    oidc_secret_hint, oidc_secret_ph = _secret_ui("oidc_client_secret")
-    token_hint, token_ph = _secret_ui("aws_session_token")
 
-    def esc(key):
-        return html.escape(CONFIG[key], quote=True)
-
-    page = SETTINGS_PAGE.format(
-        title=html.escape(app_title()),
-        status=html.escape(status),
-        state_banner="".join(banners),
-        aws_test=_test_block_html(checks),
-        app_title=esc("app_title"),
-        aws_region=esc("aws_region"),
-        dynamodb_index=esc("dynamodb_index"),
-        table_name=esc("table_name"),
-        bucket_name=esc("bucket_name"),
-        s3_prefix=esc("s3_prefix"),
-        aws_access_key_id=esc("aws_access_key_id"),
-        aws_secret_hint=aws_secret_hint,
-        aws_secret_placeholder=aws_secret_ph,
-        aws_token_hint=token_hint,
-        aws_token_placeholder=token_ph,
+def _render_sso_step(request: Request, status: str = "") -> HTMLResponse:
+    banner = ""
+    if auth_enabled() and not oidc_ready():
+        banner = ("<div class=warn>SSO is <b>on</b> but not fully configured, so the "
+                  "inbox is blocked until you finish here (or turn SSO off).</div>")
+    elif not auth_enabled():
+        banner = ("<div class=warn>SSO is <b>off</b> &mdash; the inbox is open to "
+                  "anyone who can reach this app.</div>")
+    sec_hint, sec_ph = _secret_ui("oidc_client_secret")
+    page = SSO_STEP_PAGE.format(
+        title=html.escape(app_title()), status=html.escape(status),
+        css=SET_CSS,
+        state_banner=banner,
         enabled_checked="checked" if auth_enabled() else "",
-        discovery=esc("oidc_discovery_url"),
-        client_id=esc("oidc_client_id"),
-        secret_hint=oidc_secret_hint,
-        secret_placeholder=oidc_secret_ph,
-        redirect_uri=esc("oidc_redirect_uri"),
+        discovery=_esc_cfg("oidc_discovery_url"), client_id=_esc_cfg("oidc_client_id"),
+        secret_hint=sec_hint, secret_placeholder=sec_ph,
+        redirect_uri=_esc_cfg("oidc_redirect_uri"),
         redirect_suggestion=html.escape(_redirect_suggestion(request), quote=True),
         allowed_groups=html.escape(", ".join(CONFIG["oidc_allowed_groups"]), quote=True),
     )
@@ -903,25 +1178,19 @@ def _render_settings(request: Request, status: str = "", checks=None) -> HTMLRes
 
 
 @app.get("/settings", response_class=HTMLResponse)
-def settings_form(request: Request):
+def settings_overview(request: Request, done: str = ""):
     blocked = _admin_guard(request)
     if blocked is not None:
         return blocked
-    return _render_settings(request)
+    # Brand-new install: drop straight into the wizard at step 1.
+    if _nothing_configured():
+        return RedirectResponse("/settings/aws", status_code=302)
+    status = "Setup complete." if done else ""
+    return _render_overview(request, status=status)
 
 
-@app.post("/settings")
-async def settings_save(request: Request):
-    blocked = _admin_guard(request)
-    if blocked is not None:
-        return blocked
-
-    fields = parse_qs((await request.body()).decode("utf-8"))
-
-    def one(key: str) -> str:
-        return fields.get(key, [""])[0].strip()
-
-    # General + AWS wiring
+def _save_aws_from_form(fields) -> None:
+    one = lambda k: fields.get(k, [""])[0].strip()  # noqa: E731
     CONFIG["app_title"] = one("app_title") or "inbox"
     CONFIG["aws_region"] = one("aws_region")
     CONFIG["table_name"] = one("table_name")
@@ -929,34 +1198,75 @@ async def settings_save(request: Request):
     CONFIG["bucket_name"] = one("bucket_name")
     CONFIG["s3_prefix"] = one("s3_prefix")
     CONFIG["aws_access_key_id"] = one("aws_access_key_id")
+    for key in ("aws_secret_access_key", "aws_session_token"):
+        v = one(key)
+        if v:
+            CONFIG[key] = v
+    _save_persisted_config()
+    build_aws_clients()
 
-    # Auth (OIDC)
+
+def _save_sso_from_form(fields) -> None:
+    one = lambda k: fields.get(k, [""])[0].strip()  # noqa: E731
     CONFIG["auth_disabled"] = not bool(fields.get("auth_enabled"))
     CONFIG["oidc_discovery_url"] = one("oidc_discovery_url")
     CONFIG["oidc_client_id"] = one("oidc_client_id")
     CONFIG["oidc_redirect_uri"] = one("oidc_redirect_uri")
     CONFIG["oidc_allowed_groups"] = _groups_list(one("oidc_allowed_groups"))
-
-    # Secret fields: a blank field keeps the saved value (the form masks them),
-    # so submitting the form never silently wipes a stored secret.
-    for key in _SECRET_KEYS:
-        submitted = one(key)
-        if submitted:
-            CONFIG[key] = submitted
-
+    v = one("oidc_client_secret")
+    if v:
+        CONFIG["oidc_client_secret"] = v
     _save_persisted_config()
     configure_oauth()
-    build_aws_clients()
 
-    notes = ["Saved."]
+
+@app.get("/settings/aws", response_class=HTMLResponse)
+def settings_aws_form(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+    return _render_aws_step(request)
+
+
+@app.post("/settings/aws")
+async def settings_aws_save(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+    fields = parse_qs((await request.body()).decode("utf-8"))
+    action = fields.get("action", [""])[0]
+    _save_aws_from_form(fields)
+    if action == "continue":
+        return RedirectResponse("/settings/sso", status_code=303)
+    if action == "test":
+        ok, checks = _test_aws()
+        msg = "Saved. Connection OK." if ok else "Saved, but the test found problems:"
+        return _render_aws_step(request, status=msg, checks=checks)
+    return _render_aws_step(request, status="Saved.")
+
+
+@app.get("/settings/sso", response_class=HTMLResponse)
+def settings_sso_form(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+    return _render_sso_step(request)
+
+
+@app.post("/settings/sso")
+async def settings_sso_save(request: Request):
+    blocked = _admin_guard(request)
+    if blocked is not None:
+        return blocked
+    fields = parse_qs((await request.body()).decode("utf-8"))
+    action = fields.get("action", [""])[0]
+    _save_sso_from_form(fields)
+    if action == "finish":
+        return RedirectResponse("/settings?done=1", status_code=303)
+    status = "Saved."
     if auth_enabled() and not oidc_ready():
-        notes.append("SSO is still incomplete — see the notice above.")
-
-    checks = None
-    if one("action") == "save_test":
-        _, checks = _test_aws()
-
-    return _render_settings(request, status=" ".join(notes), checks=checks)
+        status = "Saved, but SSO is still incomplete — see the notice above."
+    return _render_sso_step(request, status=status)
 
 
 BACKEND_PROBLEM_PAGE = """<!doctype html><meta charset=utf-8>
@@ -1208,3 +1518,29 @@ async def delete_messages(request: Request):
         if ids:
             _purge_messages(ids)
     return RedirectResponse("/", status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# CLI: `python app.py reset-admin-key`
+# ---------------------------------------------------------------------------
+# Run inside the container to recover admin access if the key is lost:
+#   docker exec <container> python app.py reset-admin-key
+def _cli_main(argv) -> int:
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "reset-admin-key":
+        if _ADMIN_ENV_MODE:
+            print("ADMIN_TOKEN is set in the environment, so the admin key is that "
+                  "value.\nChange it in your compose/stack env instead -- nothing to "
+                  "reset here.")
+            return 1
+        new_key = reset_admin_key()
+        print("\nNew admin key (save it now -- it will not be shown again):\n")
+        print("    " + new_key + "\n")
+        print("Go to the app's /settings and unlock with this key.")
+        return 0
+    print("Usage: python app.py reset-admin-key")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(_cli_main(sys.argv))

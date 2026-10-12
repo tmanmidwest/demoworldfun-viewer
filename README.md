@@ -36,21 +36,22 @@ There are two layers:
    read from a matching env var **on first boot**, so an unattended / env-driven
    deployment still works. Once you save in the UI, the stored file wins.
 
-### What must stay in the environment
+### What stays in the environment
 
-Four "bootstrap" settings can't be moved into the UI, because each would be
-circular to configure through the very page it enables:
+Nothing *has* to be set — the admin key that unlocks the wizard is generated on
+first boot (see [Admin key](#admin-key)). These settings remain optional:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ADMIN_TOKEN` | **yes** | Unlocks `/settings`. If unset, the settings page is **disabled** (fail-closed) so an exposed instance can't have its auth reconfigured by a stranger. |
+| `ADMIN_TOKEN` | no | Pins the admin key to a fixed value instead of generating one. Leave blank to use the generated key. |
 | `SESSION_SECRET` | recommended | Signs the session cookie (incl. the admin unlock). Set it so the unlock and logins survive a restart; otherwise a random one is generated per process. |
 | `SECURE_COOKIES` | no | `true` when served over HTTPS (marks the session cookie `Secure`). A transport flag applied at startup. |
 | `CONFIG_FILE` | no | Where UI settings are stored (default `/data/config.json`). |
+| `ADMIN_KEY_FILE` | no | Where the admin-key hash is stored (default `/data/admin.key`). |
 | `HOST_PORT` | compose only | Host port (default `8100`). |
 
-The **minimal `.env` is just `ADMIN_TOKEN` (plus `SESSION_SECRET`)** — then
-configure everything else at `/settings`.
+You can bring up the container with **no env vars at all**, grab the generated
+admin key, and configure everything else in the wizard at `/settings`.
 
 ### What you configure at `/settings` (env seeds shown in parentheses)
 
@@ -75,24 +76,59 @@ configure everything else at `/settings`.
 Secret fields (client secret, AWS secret key, session token) are masked; leaving
 one blank on save **keeps the stored value** rather than wiping it.
 
-## The settings page
+## Admin key
 
-Open `http://<host>:<port>/settings` (also linked top-right of the inbox).
+The setup wizard configures OIDC — the app's own login — so it can't be protected
+by that login. It's gated by an **admin key** instead:
 
-- **Unlocking.** You'll be asked for the `ADMIN_TOKEN`. It's stored in your signed
-  session; use **Lock settings** to clear it. This gate is deliberately separate
-  from SSO — SSO *is* the login, so the page that configures it can't be behind
-  that login.
-- **Save & test AWS.** Runs the exact operations the app uses — a DynamoDB
-  `Query` on the feed index, then an S3 `HeadObject` (same permission as
-  `GetObject`) on a real message key — and reports PASS/FAIL per check. Use it to
-  verify credentials and IAM permissions after entering them.
-- **Fail-closed behavior.** If SSO is enabled but not fully configured, the inbox
-  is blocked (you're sent to a "configure SSO" notice) rather than served without
-  a login. If the AWS backend isn't configured, the inbox shows a "set this up at
-  Settings" page (HTTP 503); if a backend call fails (wrong keys, missing IAM
-  permission), it shows the error and points at **Save & test AWS** (HTTP 502)
-  instead of a raw 500.
+- **On first boot**, if `ADMIN_TOKEN` isn't set, the app generates a strong random
+  key. It's shown **once** in the browser the first time you open the app, and
+  also printed **once** to the container log (`docker logs <container>` or the
+  Portainer log viewer). Only a hash is stored on the `/data` volume — the
+  plaintext is never written to disk.
+- **Save it** in your password manager. It can't be displayed again.
+- **Lost it?** It can't be recovered — regenerate it (the only recovery path):
+
+  ```bash
+  docker exec <container> python app.py reset-admin-key
+  ```
+
+  This prints a fresh key, invalidates the old one, and leaves everything else
+  (AWS/OIDC config, sessions) intact.
+- **Pin it instead:** set `ADMIN_TOKEN` in the environment and that fixed value is
+  the admin key — nothing is generated or stored.
+
+Because the key hash lives on the `/data` volume alongside `config.json`, copying
+that volume to a new host migrates the admin identity too.
+
+> **Security note:** because the key is shown on the first web visit and the app
+> may be internet-exposed, claim it immediately after deploying (ideally over your
+> LAN). If anyone could have seen it first, reset it with the command above. It's
+> shown only once, then never again until a reset.
+
+## The setup wizard
+
+Open `http://<host>:<port>/settings` (also linked top-right of the inbox). Unlock
+with the admin key (stored in your signed session; **Lock settings** clears it).
+
+On a fresh install it drops you straight into a two-step wizard; afterwards the
+same steps are editable from the settings overview:
+
+1. **AWS backend** — region, table, index, bucket, prefix, and credentials, with a
+   **Test connection** button that runs the exact operations the app uses (a
+   DynamoDB `Query` on the feed index, then an S3 `HeadObject` — same permission
+   as `GetObject` — on a real message key) and reports PASS/FAIL per check.
+2. **Single sign-on** — the OIDC toggle and Authentik details.
+
+The overview page then shows the status of each area (Configured / Not set up /
+Disabled / Incomplete) with Edit links, plus the admin-key recovery command.
+
+**Fail-closed behavior.** If SSO is enabled but not fully configured, the inbox is
+blocked (you're sent to a "configure SSO" notice) rather than served without a
+login. If the AWS backend isn't configured, the inbox shows a "set this up at
+Settings" page (HTTP 503); if a backend call fails (wrong keys, missing IAM
+permission), it shows the error and points at **Test connection** (HTTP 502)
+instead of a raw 500.
 
 ## AWS credentials & IAM permissions
 
@@ -132,9 +168,9 @@ The IAM identity only ever needs:
 
 `Query`/`UpdateItem`/`DeleteItem` cover listing, marking-read, and delete;
 `GetObject`/`DeleteObject` cover rendering and deleting message bodies. The
-**Save & test AWS** button deliberately checks only these — it does **not** need
-`ListBucket` or `DescribeTable`. (Adjust `global-index` if you set a different
-DynamoDB index.)
+**Test connection** button (AWS step of the wizard) deliberately checks only
+these — it does **not** need `ListBucket` or `DescribeTable`. (Adjust
+`global-index` if you set a different DynamoDB index.)
 
 ## Setting up the login (OIDC / Authentik SSO)
 
@@ -187,25 +223,20 @@ Notes:
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # set at least ADMIN_TOKEN (+ SESSION_SECRET)
-export CONFIG_FILE=./config.json   # a writable path for local runs
-set -a && . ./.env && set +a       # load .env into the shell
+export CONFIG_FILE=./config.json ADMIN_KEY_FILE=./admin.key   # writable local paths
+export SESSION_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 uvicorn app:app --reload --port 8000
-# http://localhost:8000  → open /settings to finish configuration
-```
-
-Generate the bootstrap secrets with:
-
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # run twice: ADMIN_TOKEN, SESSION_SECRET
+# http://localhost:8000  → the first visit shows your generated admin key,
+#   then walks you through the setup wizard. (The key is also printed to the log.)
 ```
 
 ### Docker / homelab (compose)
 
 ```bash
-cp .env.example .env          # set at least ADMIN_TOKEN (+ SESSION_SECRET)
+cp .env.example .env          # optional: set SESSION_SECRET; everything else can be blank
 docker compose up -d --build
-# http://<host>:8100  → open /settings to finish configuration
+docker logs demoworldfun-viewer | grep -A1 "ADMIN KEY"   # grab the generated key
+# http://<host>:8100  → unlock with that key and finish the wizard
 ```
 
 The compose file mounts a named `viewer-data` volume at `/data`, so your saved
