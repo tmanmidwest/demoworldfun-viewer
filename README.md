@@ -50,8 +50,8 @@ first boot (see [Admin key](#admin-key)). These settings remain optional:
 | `ADMIN_KEY_FILE` | no | Where the admin-key hash is stored (default `/data/admin.key`). |
 | `HOST_PORT` | compose only | Host port (default `8100`). |
 
-You can bring up the container with **no env vars at all**, grab the generated
-admin key, and configure everything else in the wizard at `/settings`.
+You can bring up the container with **no env vars at all**, then open it and let
+first-run setup create your admin key and walk you through the wizard.
 
 ### What you configure at `/settings` (env seeds shown in parentheses)
 
@@ -76,17 +76,17 @@ admin key, and configure everything else in the wizard at `/settings`.
 Secret fields (client secret, AWS secret key, session token) are masked; leaving
 one blank on save **keeps the stored value** rather than wiping it.
 
-## Admin key
+## First-run setup & the admin key
 
 The setup wizard configures OIDC — the app's own login — so it can't be protected
-by that login. It's gated by an **admin key** instead:
+by that login. It's gated by an **admin key** instead, created entirely in the UI:
 
-- **On first boot**, if `ADMIN_TOKEN` isn't set, the app generates a strong random
-  key. It's shown **once** in the browser the first time you open the app, and
-  also printed **once** to the container log (`docker logs <container>` or the
-  Portainer log viewer). Only a hash is stored on the `/data` volume — the
-  plaintext is never written to disk.
-- **Save it** in your password manager. It can't be displayed again.
+- **First time you open the app**, it takes you to a short **first-run setup**.
+  Click **Generate my admin key** and the key is created and shown to you **once**,
+  right there in the browser — no logs to dig through. Save it in your password
+  manager, click continue, and you're dropped into the configuration wizard.
+- Only a **hash** is stored on the `/data` volume; the key itself is never written
+  to disk and can't be displayed again.
 - **Lost it?** It can't be recovered — regenerate it (the only recovery path):
 
   ```bash
@@ -96,23 +96,24 @@ by that login. It's gated by an **admin key** instead:
   This prints a fresh key, invalidates the old one, and leaves everything else
   (AWS/OIDC config, sessions) intact.
 - **Pin it instead:** set `ADMIN_TOKEN` in the environment and that fixed value is
-  the admin key — nothing is generated or stored.
+  the admin key — no first-run key step, nothing generated or stored.
 
 Because the key hash lives on the `/data` volume alongside `config.json`, copying
 that volume to a new host migrates the admin identity too.
 
-> **Security note:** because the key is shown on the first web visit and the app
-> may be internet-exposed, claim it immediately after deploying (ideally over your
-> LAN). If anyone could have seen it first, reset it with the command above. It's
-> shown only once, then never again until a reset.
+> **Security note:** the key is shown in the browser during first-run setup, and
+> the app may be internet-exposed, so do the setup immediately after deploying
+> (ideally over your LAN) to claim the key first. If anyone could have reached it
+> before you, reset it with the command above. It's shown only once.
 
 ## The setup wizard
 
-Open `http://<host>:<port>/settings` (also linked top-right of the inbox). Unlock
-with the admin key (stored in your signed session; **Lock settings** clears it).
+After first-run setup (or any later visit to `/settings`, linked top-right of the
+inbox) you unlock with the admin key — stored in your signed session; **Lock
+settings** clears it.
 
-On a fresh install it drops you straight into a two-step wizard; afterwards the
-same steps are editable from the settings overview:
+A fresh install flows straight from the key step into a two-step wizard;
+afterwards the same steps are editable from the settings overview:
 
 1. **AWS backend** — region, table, index, bucket, prefix, and credentials, with a
    **Test connection** button that runs the exact operations the app uses (a
@@ -226,8 +227,8 @@ pip install -r requirements.txt
 export CONFIG_FILE=./config.json ADMIN_KEY_FILE=./admin.key   # writable local paths
 export SESSION_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 uvicorn app:app --reload --port 8000
-# http://localhost:8000  → the first visit shows your generated admin key,
-#   then walks you through the setup wizard. (The key is also printed to the log.)
+# http://localhost:8000  → first-run setup generates your admin key in the
+#   browser, then walks you through the setup wizard.
 ```
 
 ### Docker / homelab (compose)
@@ -235,8 +236,8 @@ uvicorn app:app --reload --port 8000
 ```bash
 cp .env.example .env          # optional: set SESSION_SECRET; everything else can be blank
 docker compose up -d --build
-docker logs demoworldfun-viewer | grep -A1 "ADMIN KEY"   # grab the generated key
-# http://<host>:8100  → unlock with that key and finish the wizard
+# http://<host>:8100  → first-run setup generates your admin key in the browser,
+#   then walks you through the wizard. No logs to read.
 ```
 
 The compose file mounts a named `viewer-data` volume at `/data`, so your saved

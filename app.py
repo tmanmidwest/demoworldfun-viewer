@@ -46,8 +46,8 @@ log = logging.getLogger("viewer")
 # ---------------------------------------------------------------------------
 # Almost everything is configured through the setup wizard at /settings and
 # persisted to CONFIG_FILE. Nothing *has* to be set in the environment anymore:
-# the admin key that unlocks the wizard is generated on first boot (see the Admin
-# key section) and shown to you once. These environment settings remain optional:
+# the admin key that unlocks the wizard is created in the in-app first-run setup
+# (see the Admin key section) and shown once. These env settings remain optional:
 #   - ADMIN_TOKEN    pins the admin key to a fixed value instead of generating one
 #                    (declarative / power-user path). Leave it unset to use the
 #                    generated key.
@@ -123,10 +123,11 @@ _SECRET_KEYS = ("oidc_client_secret", "aws_secret_access_key", "aws_session_toke
 # The wizard configures OIDC, which is the app's own login, so it can't be
 # protected by that login. It's gated by an "admin key" instead:
 #   - If ADMIN_TOKEN is set, that IS the admin key (nothing generated or stored).
-#   - Otherwise a strong key is generated on first boot, shown ONCE in the browser
-#     and printed ONCE to the container log, and only a hash is stored on the
-#     volume. The plaintext is never written to disk and can't be shown again;
-#     if it's lost, regenerate it from the CLI:
+#   - Otherwise, on a brand-new install the app has NO key yet. The first time you
+#     open it you're taken to an in-app first-run setup that generates the key on
+#     demand and shows it ONCE in the browser (no log digging needed). Only a hash
+#     is stored on the volume; the plaintext is never written to disk and can't be
+#     shown again. Lost it? Regenerate from the CLI (the only recovery):
 #         docker exec <container> python app.py reset-admin-key
 ADMIN_KEY_FILE = os.environ.get(
     "ADMIN_KEY_FILE",
@@ -172,10 +173,11 @@ def _new_admin_key() -> str:
     return secrets.token_urlsafe(30)
 
 
-def init_admin_key(generate_if_missing: bool = True) -> None:
-    """Resolve the admin key at startup. In env mode it's ADMIN_TOKEN; otherwise
-    load the stored hash, or generate a fresh key on first boot."""
-    global _ADMIN_KEY_HASH, _ADMIN_KEY_PLAINTEXT, _ADMIN_KEY_REVEALED
+def init_admin_key() -> None:
+    """Resolve the admin key at startup -- but never generate one here. In env mode
+    it's ADMIN_TOKEN; otherwise load any stored hash. On a brand-new install there
+    is no key yet; it's created on demand by the first-run setup in the UI."""
+    global _ADMIN_KEY_HASH, _ADMIN_KEY_REVEALED
     if _ADMIN_ENV_MODE:
         _ADMIN_KEY_REVEALED = True
         return
@@ -183,20 +185,26 @@ def init_admin_key(generate_if_missing: bool = True) -> None:
     if saved and saved.get("hash"):
         _ADMIN_KEY_HASH = saved["hash"]
         _ADMIN_KEY_REVEALED = bool(saved.get("revealed", True))
-        _ADMIN_KEY_PLAINTEXT = None  # a stored key can't be recovered
-        return
-    if not generate_if_missing:
-        return
+    else:
+        log.info("No admin key yet -- open the app to run first-time setup.")
+
+
+def admin_key_is_set() -> bool:
+    """True once an admin key exists (env-pinned, or generated and stored)."""
+    return _ADMIN_ENV_MODE or bool(_ADMIN_KEY_HASH)
+
+
+def generate_admin_key() -> str:
+    """Create the admin key on demand during first-run setup. Stores the hash,
+    holds the plaintext in memory for its one-time reveal. Returns plaintext."""
+    global _ADMIN_KEY_HASH, _ADMIN_KEY_PLAINTEXT, _ADMIN_KEY_REVEALED
     key = _new_admin_key()
     _ADMIN_KEY_HASH = _hash_admin_key(key)
     _ADMIN_KEY_PLAINTEXT = key
     _ADMIN_KEY_REVEALED = False
     _write_admin_key_file(_ADMIN_KEY_HASH, revealed=False)
-    bar = "=" * 60
-    log.warning("\n%s\nADMIN KEY generated on first boot -- save it now (shown once):"
-                "\n\n    %s\n\nThe app will also show it once in the browser. Lost it?"
-                "\n  docker exec <container> python app.py reset-admin-key\n%s",
-                bar, key, bar)
+    log.info("Admin key created via first-time setup.")
+    return key
 
 
 def reset_admin_key() -> str:
@@ -398,9 +406,7 @@ def _test_aws():
 _load_persisted_config()
 configure_oauth()
 build_aws_clients()
-# Don't auto-generate a key when run as a CLI command (e.g. reset-admin-key);
-# the command handles key creation itself.
-init_admin_key(generate_if_missing=(__name__ != "__main__"))
+init_admin_key()  # loads env/stored key; never generates (first-run setup does)
 
 app = FastAPI(title="inbox")
 app.add_middleware(
@@ -629,7 +635,39 @@ LOGGED_OUT_PAGE = """<!doctype html><meta charset=utf-8>
 </div>"""
 
 
-# One-time reveal of a freshly generated admin key (first boot only).
+# First-run welcome: generate the admin key on demand (no logs needed).
+SETUP_START_PAGE = """<!doctype html><meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} &mdash; first-time setup</title>
+<style>
+ body{{font:14px system-ui,sans-serif;margin:0;display:flex;justify-content:center}}
+ .wrap{{max-width:560px;padding:2.4rem 1.2rem}}
+ h2{{margin:0 0 .4rem}}
+ p{{color:#444;line-height:1.5}}
+ ol{{color:#444;line-height:1.6;padding-left:1.2rem}}
+ button{{margin-top:1rem;padding:.7rem 1.3rem;border:0;border-radius:4px;
+         background:#0645ad;color:#fff;font-size:15px;cursor:pointer}}
+ .muted{{color:#777;font-size:12px;margin-top:1.2rem}}
+</style>
+<div class=wrap>
+ <h2>Welcome to {title}</h2>
+ <p>Let's secure this install. First we'll create an <b>admin key</b> &mdash; it
+    unlocks setup and settings. After that you'll configure the AWS backend and
+    (optionally) single sign-on.</p>
+ <ol>
+  <li>Generate your admin key (shown once &mdash; save it in a password manager).</li>
+  <li>Set up the AWS backend.</li>
+  <li>Set up single sign-on, or run without a login.</li>
+ </ol>
+ <form method=post action='/setup/generate'>
+  <button type=submit>Generate my admin key &rarr;</button>
+ </form>
+ <p class=muted>The key is generated here in the app &mdash; no need to read any
+    logs. Only a hash is stored; the key itself is shown to you one time.</p>
+</div>"""
+
+
+# One-time reveal of the freshly generated admin key.
 KEY_REVEAL_PAGE = """<!doctype html><meta charset=utf-8>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} &mdash; save your admin key</title>
@@ -873,6 +911,10 @@ def healthz():
 @app.get("/login")
 async def login(request: Request, error: str = ""):
     """Start the OIDC Authorization Code flow (or show an error after a failure)."""
+    # Brand-new install: there's no admin key yet, so nothing is configured --
+    # send the first visitor into first-run setup rather than an SSO dead-end.
+    if not admin_key_is_set():
+        return RedirectResponse("/setup", status_code=302)
     if not auth_enabled() or request.session.get("user"):
         return RedirectResponse("/", status_code=302)
     if not oidc_ready():
@@ -956,15 +998,16 @@ def logged_out():
 # Settings / setup wizard (AWS + OIDC configured through the UI)
 # ---------------------------------------------------------------------------
 # Access is gated by the admin KEY, NOT by SSO -- SSO is the very thing configured
-# here, so it can't protect its own setup page. The key is generated on first boot
-# (shown once) or pinned via ADMIN_TOKEN; see the Admin key section above.
+# here, so it can't protect its own setup page. The key is created by the in-app
+# first-run setup (shown once) or pinned via ADMIN_TOKEN; see the Admin key section.
 def _admin_guard(request: Request):
-    """Return None if allowed, else a Response to send instead (reveal / unlock)."""
+    """Return None if allowed, else a Response to send instead (setup / unlock)."""
     if admin_ok(request):
         return None
-    # First boot: a freshly generated key hasn't been shown yet -> show it once.
+    if not admin_key_is_set():
+        return RedirectResponse("/setup", status_code=302)   # first-run: make a key
     if admin_key_pending_reveal():
-        return RedirectResponse("/setup/key", status_code=302)
+        return RedirectResponse("/setup/key", status_code=302)  # show it once
     return RedirectResponse("/settings/unlock", status_code=302)
 
 
@@ -975,9 +1018,33 @@ def _redirect_suggestion(request: Request) -> str:
         return "https://your-app-host/auth/callback"
 
 
+@app.get("/setup", response_class=HTMLResponse)
+def setup_start(request: Request):
+    """First-run welcome: create the admin key in the UI (no logs needed)."""
+    if admin_ok(request):
+        return RedirectResponse("/settings", status_code=302)
+    if admin_key_pending_reveal():
+        return RedirectResponse("/setup/key", status_code=302)
+    if admin_key_is_set():
+        # Key already exists (env-pinned or set on a prior run) -> just unlock.
+        return RedirectResponse("/settings/unlock", status_code=302)
+    return HTMLResponse(SETUP_START_PAGE.format(title=html.escape(app_title())))
+
+
+@app.post("/setup/generate")
+async def setup_generate(request: Request):
+    """Generate the admin key on demand, then reveal it once."""
+    if _ADMIN_ENV_MODE or (admin_key_is_set() and not admin_key_pending_reveal()):
+        # Already have a key; don't clobber it -> go unlock instead.
+        return RedirectResponse("/settings/unlock", status_code=303)
+    if not admin_key_pending_reveal():
+        generate_admin_key()
+    return RedirectResponse("/setup/key", status_code=303)
+
+
 @app.get("/setup/key", response_class=HTMLResponse)
 def setup_key_form(request: Request):
-    """One-time reveal of a freshly generated admin key."""
+    """One-time reveal of the freshly generated admin key."""
     if admin_key_pending_reveal():
         return HTMLResponse(
             KEY_REVEAL_PAGE.format(
@@ -985,9 +1052,11 @@ def setup_key_form(request: Request):
                 key=html.escape(_ADMIN_KEY_PLAINTEXT or "", quote=True),
             )
         )
-    # Nothing to reveal: either already shown, env-pinned, or lost on a restart.
+    # Nothing to reveal: not created yet, already shown, env-pinned, or lost on a restart.
     if admin_ok(request):
         return RedirectResponse("/settings", status_code=302)
+    if not admin_key_is_set():
+        return RedirectResponse("/setup", status_code=302)
     return RedirectResponse("/settings/unlock", status_code=302)
 
 
@@ -1030,7 +1099,7 @@ async def settings_unlock(request: Request):
 def _unlock_source_hint() -> str:
     if _ADMIN_ENV_MODE:
         return "This is the <code>ADMIN_TOKEN</code> set in the container environment."
-    return ("The key shown once on first boot. Lost it? Run "
+    return ("The key created during first-time setup. Lost it? Run "
             "<code>docker exec &lt;container&gt; python app.py reset-admin-key</code>.")
 
 
@@ -1112,8 +1181,8 @@ def _render_overview(request: Request, status: str = "") -> HTMLResponse:
         admin_note = ("The admin key is pinned via <code>ADMIN_TOKEN</code> in the "
                       "container environment.")
     else:
-        admin_note = ("Generated on first boot and shown once. Lost it? It can't be "
-                      "recovered &mdash; issue a new one with "
+        admin_note = ("Created during first-time setup and shown once. Lost it? It "
+                      "can't be recovered &mdash; issue a new one with "
                       "<code>docker exec &lt;container&gt; python app.py reset-admin-key</code>.")
 
     banner = ""
@@ -1319,6 +1388,9 @@ def _backend_error(exc: Exception) -> HTMLResponse:
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_login)])
 def inbox_all():
+    # Brand-new install: send the first visitor through first-run setup.
+    if not admin_key_is_set():
+        return RedirectResponse("/setup", status_code=302)
     if not aws_ready():
         return _backend_unconfigured()
     try:
